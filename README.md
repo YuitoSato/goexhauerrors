@@ -11,7 +11,7 @@ In Go, `errors.Is` and `errors.As` are used to identify error types, but it's ea
 ## Installation
 
 ```bash
-go install github.com/yuito-sato/goexhauerrors@latest
+go install github.com/YuitoSato/goexhauerrors@latest
 ```
 
 ## Quick Start

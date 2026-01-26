@@ -3,7 +3,7 @@ package goexhauerrors_test
 import (
 	"testing"
 
-	"github.com/yuito-sato/goexhauerrors/goexhauerrors"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 

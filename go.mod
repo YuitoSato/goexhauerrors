@@ -1,4 +1,4 @@
-module github.com/yuito-sato/goexhauerrors
+module github.com/YuitoSato/goexhauerrors
 
 go 1.23.0
 

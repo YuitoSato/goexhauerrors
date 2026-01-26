@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/yuito-sato/goexhauerrors/goexhauerrors"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors"
 	"golang.org/x/tools/go/analysis/singlechecker"
 )
 
