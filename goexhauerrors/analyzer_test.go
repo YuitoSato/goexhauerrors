@@ -20,5 +20,9 @@ func TestAnalyzer(t *testing.T) {
 		"reassign",
 		"conditional",
 		"limitations",
+		"nested",
+		"crosspkg/errors",
+		"crosspkg/middle",
+		"crosspkg/caller",
 	)
 }

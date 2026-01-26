@@ -21,6 +21,11 @@ func (f *SentinelErrorFact) String() string {
 	return f.PkgPath + "." + f.Name
 }
 
+// Key returns a unique key for this sentinel.
+func (f *SentinelErrorFact) Key() string {
+	return f.PkgPath + "." + f.Name
+}
+
 // SentinelInfo contains metadata about a sentinel error that a function can return.
 type SentinelInfo struct {
 	PkgPath string // Package path where sentinel is defined
@@ -71,4 +76,16 @@ func (f *FunctionSentinelsFact) Merge(other *FunctionSentinelsFact) {
 	for _, s := range other.Sentinels {
 		f.AddSentinel(s)
 	}
+}
+
+// FilterByValidSentinels removes sentinels that are not in the provided set of valid sentinels.
+// validSentinels is a map from sentinel key (PkgPath.Name) to true.
+func (f *FunctionSentinelsFact) FilterByValidSentinels(validSentinels map[string]bool) {
+	var filtered []SentinelInfo
+	for _, s := range f.Sentinels {
+		if validSentinels[s.Key()] {
+			filtered = append(filtered, s)
+		}
+	}
+	f.Sentinels = filtered
 }

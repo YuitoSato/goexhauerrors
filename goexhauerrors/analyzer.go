@@ -4,6 +4,7 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 )
 
@@ -13,6 +14,7 @@ var Analyzer = &analysis.Analyzer{
 	Run:  run,
 	Requires: []*analysis.Analyzer{
 		inspect.Analyzer,
+		buildssa.Analyzer,
 	},
 	FactTypes: []analysis.Fact{
 		(*SentinelErrorFact)(nil),

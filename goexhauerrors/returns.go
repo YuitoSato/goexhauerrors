@@ -20,7 +20,8 @@ type funcInfo struct {
 // analyzeFunctionReturns analyzes all functions in the package and exports
 // FunctionSentinelsFact for each function that can return sentinel errors.
 // It uses iterative analysis to handle factory functions that call other
-// functions returning sentinels.
+// functions returning sentinels, combined with SSA-based analysis to track
+// errors through variables.
 func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -61,13 +62,24 @@ func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
 	// Track facts for local functions during iteration
 	localFacts := make(map[*types.Func]*FunctionSentinelsFact)
 
-	// Iterate until no new facts are discovered
+	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
 	for {
 		changed := false
 
+		// Create SSA analyzer with current local facts
+		ssaAnalyzer := newSSAAnalyzer(pass, sentinels, localFacts)
+
 		for _, fi := range funcs {
 			fact := &FunctionSentinelsFact{}
+
+			// AST-based analysis
 			analyzeReturnsWithLocalFacts(pass, fi.body, fi.errorPositions, sentinels, fact, localFacts)
+
+			// SSA-based analysis to trace errors through variables
+			ssaSentinels := ssaAnalyzer.traceReturnStatements(fi.fn, fi.errorPositions)
+			for _, s := range ssaSentinels {
+				fact.AddSentinel(s)
+			}
 
 			existing := localFacts[fi.fn]
 			if existing == nil {
@@ -90,12 +102,62 @@ func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
 		}
 	}
 
-	// Export all discovered facts
+	// Build set of valid sentinels (local + imported with facts)
+	validSentinels := buildValidSentinels(pass, sentinels)
+
+	// Export all discovered facts, filtering out invalid sentinels
 	for fn, fact := range localFacts {
+		fact.FilterByValidSentinels(validSentinels)
 		if len(fact.Sentinels) > 0 {
 			pass.ExportObjectFact(fn, fact)
 		}
 	}
+}
+
+// buildValidSentinels creates a set of valid sentinel keys that can be used in FunctionSentinelsFact.
+// A sentinel is valid if:
+// 1. It's a local sentinel (var or type) in the current package
+// 2. It has an imported SentinelErrorFact
+func buildValidSentinels(pass *analysis.Pass, sentinels *localSentinels) map[string]bool {
+	valid := make(map[string]bool)
+
+	// Add local sentinel variables
+	for varObj := range sentinels.vars {
+		key := pass.Pkg.Path() + "." + varObj.Name()
+		valid[key] = true
+	}
+
+	// Add local custom error types
+	for typeName := range sentinels.types {
+		key := pass.Pkg.Path() + "." + typeName.Name()
+		valid[key] = true
+	}
+
+	// Note: Imported sentinels are validated by checking ImportObjectFact during analysis
+	// We need to also allow imported sentinels that have facts
+	// This is done by scanning all referenced packages for exported facts
+	for _, imp := range pass.Pkg.Imports() {
+		scope := imp.Scope()
+		for _, name := range scope.Names() {
+			obj := scope.Lookup(name)
+			// Check for sentinel variable facts
+			if varObj, ok := obj.(*types.Var); ok {
+				var sentinelFact SentinelErrorFact
+				if pass.ImportObjectFact(varObj, &sentinelFact) {
+					valid[sentinelFact.Key()] = true
+				}
+			}
+			// Check for sentinel type facts
+			if typeName, ok := obj.(*types.TypeName); ok {
+				var sentinelFact SentinelErrorFact
+				if pass.ImportObjectFact(typeName, &sentinelFact) {
+					valid[sentinelFact.Key()] = true
+				}
+			}
+		}
+	}
+
+	return valid
 }
 
 // analyzeReturnsWithLocalFacts is like analyzeReturns but also checks local function facts.
