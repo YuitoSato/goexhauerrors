@@ -89,7 +89,61 @@ func Query() error {
 }
 ```
 
-### 5. Factory Functions
+### 5. Error Propagation Through Variables (SSA-based)
+
+Tracks errors assigned to variables and returned later using SSA dataflow analysis:
+
+```go
+func Nested3() error {
+    return ErrNotFound
+}
+
+func Nested2() error {
+    err := Nested3()  // SSA tracks: err holds ErrNotFound
+    if err != nil {
+        return err    // Detected: propagates ErrNotFound
+    }
+    return nil
+}
+
+func Caller() {
+    err := Nested2() // Requires errors.Is check for ErrNotFound
+}
+```
+
+Also works across packages:
+
+```go
+// package errors
+func GetError() error { return ErrCrossPkg }
+
+// package middle
+func PropagateViaVar() error {
+    err := errors.GetError()
+    return err  // SSA tracks cross-package propagation
+}
+
+// package caller
+func BadCaller() {
+    err := middle.PropagateViaVar() // Requires errors.Is check for ErrCrossPkg
+}
+```
+
+Handles conditional branches (Phi nodes):
+
+```go
+func ConditionalReturn(cond bool) error {
+    var err error
+    if cond {
+        err = GetErrorA()  // ErrA
+    } else {
+        err = GetErrorB()  // ErrB
+    }
+    return err  // Both ErrA and ErrB are tracked
+}
+```
+
+### 6. Factory Functions
 
 Tracks errors returned by factory functions through call chains:
 
@@ -107,7 +161,7 @@ func Caller() {
 }
 ```
 
-### 6. Closures and Anonymous Functions
+### 7. Closures and Anonymous Functions
 
 Tracks errors returned by closures assigned to variables:
 
@@ -120,7 +174,7 @@ func UseClosure() {
 }
 ```
 
-### 7. Variable Reassignment Scope
+### 8. Variable Reassignment Scope
 
 Properly handles variable reassignment with flow-sensitive analysis:
 
@@ -214,6 +268,9 @@ func PropagatingCaller() error {
 - Factory function chains
 - Closure variable calls
 - Flow-sensitive variable reassignment
+- **SSA-based variable tracking** (errors assigned to variables and returned)
+- **Cross-package error propagation through variables**
+- **Conditional branch merging (Phi nodes)**
 
 ## Limitations
 
@@ -310,6 +367,10 @@ func CreateError(msg string) error {
 | Custom error types | Yes | Structs implementing `error` |
 | Function/method returns | Yes | Direct sentinel returns |
 | Wrapped errors (%w) | Yes | `fmt.Errorf` with `%w` |
+| **Variable propagation** | **Yes** | **SSA-based: `err := F(); return err`** |
+| **Cross-package via variable** | **Yes** | **SSA tracks through packages** |
+| **Conditional branches (Phi)** | **Yes** | **`if cond { err = A() } else { err = B() }`** |
+| **Multi-return extraction** | **Yes** | **`_, err := MultiReturn(); return err`** |
 | Factory functions | Yes | Through call chain analysis |
 | Closures | Yes | Assigned to variables |
 | Variable reassignment | Yes | Flow-sensitive analysis |
