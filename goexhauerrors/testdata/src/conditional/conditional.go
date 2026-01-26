@@ -65,3 +65,37 @@ func GoodMultipleCaller() {
 		println("error B")
 	}
 }
+
+// ConditionError is a custom error type for conditional testing
+type ConditionError struct { // want ConditionError:`conditional.ConditionError`
+	Condition string
+}
+
+func (e *ConditionError) Error() string {
+	return "condition error: " + e.Condition
+}
+
+// ConditionalCustomReturn returns custom error based on condition
+func ConditionalCustomReturn(flag bool) error { // want ConditionalCustomReturn:`\[conditional.ConditionError\]`
+	if flag {
+		return &ConditionError{Condition: "flag was true"}
+	}
+	return nil
+}
+
+// BadCallerCustom does not check for ConditionError
+func BadCallerCustom() {
+	err := ConditionalCustomReturn(true) // want "missing errors.Is check for conditional.ConditionError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+// GoodCallerCustom properly checks for ConditionError
+func GoodCallerCustom() {
+	err := ConditionalCustomReturn(true)
+	var condErr *ConditionError
+	if errors.As(err, &condErr) {
+		println("condition error:", condErr.Condition)
+	}
+}

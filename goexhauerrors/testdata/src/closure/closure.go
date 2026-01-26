@@ -51,3 +51,35 @@ func UseVarDeclaration() {
 		println(err.Error())
 	}
 }
+
+// ClosureError is a custom error type for closure testing
+type ClosureError struct { // want ClosureError:`closure.ClosureError`
+	Message string
+}
+
+func (e *ClosureError) Error() string {
+	return "closure error: " + e.Message
+}
+
+func UseClosureCustom() {
+	handler := func() error { // want handler:`\[closure.ClosureError\]`
+		return &ClosureError{Message: "from closure"}
+	}
+
+	err := handler() // want "missing errors.Is check for closure.ClosureError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func UseClosureCustomGood() {
+	handler := func() error { // want handler:`\[closure.ClosureError\]`
+		return &ClosureError{Message: "from closure"}
+	}
+
+	err := handler()
+	var closureErr *ClosureError
+	if errors.As(err, &closureErr) {
+		println("closure error:", closureErr.Message)
+	}
+}

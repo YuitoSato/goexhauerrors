@@ -32,3 +32,26 @@ func GoodCaller() {
 		println("validation error on field:", validationErr.Field)
 	}
 }
+
+var ErrValidation = errors.New("validation failed") // want ErrValidation:`customtype.ErrValidation`
+
+func ValidateSentinel(field string) error { // want ValidateSentinel:`\[customtype.ErrValidation\]`
+	if field == "" {
+		return ErrValidation
+	}
+	return nil
+}
+
+func BadCallerSentinel() {
+	err := ValidateSentinel("") // want "missing errors.Is check for customtype.ErrValidation"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerSentinel() {
+	err := ValidateSentinel("")
+	if errors.Is(err, ErrValidation) {
+		println("validation failed")
+	}
+}

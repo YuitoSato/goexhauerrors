@@ -54,3 +54,27 @@ func GoodCaller() {
 		println("validation error on field:", validationErr.Field)
 	}
 }
+
+var ErrFactory = errors.New("factory error") // want ErrFactory:`factory.ErrFactory`
+
+func NewFactorySentinel() error { // want NewFactorySentinel:`\[factory.ErrFactory\]`
+	return ErrFactory
+}
+
+func UseFactorySentinel() error { // want UseFactorySentinel:`\[factory.ErrFactory\]`
+	return NewFactorySentinel()
+}
+
+func BadCallerSentinel() {
+	err := UseFactorySentinel() // want "missing errors.Is check for factory.ErrFactory"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerSentinel() {
+	err := UseFactorySentinel()
+	if errors.Is(err, ErrFactory) {
+		println("factory error")
+	}
+}

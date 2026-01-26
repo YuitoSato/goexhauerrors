@@ -47,3 +47,34 @@ func SwitchCaller() {
 		println("permission denied")
 	}
 }
+
+// NotFoundError is a custom error type for testing errors.As
+type NotFoundError struct { // want NotFoundError:`basic.NotFoundError`
+	Resource string
+}
+
+func (e *NotFoundError) Error() string {
+	return "not found: " + e.Resource
+}
+
+func GetResource(name string) error { // want GetResource:`\[basic.NotFoundError\]`
+	if name == "" {
+		return &NotFoundError{Resource: "unknown"}
+	}
+	return nil
+}
+
+func BadCallerCustom() {
+	err := GetResource("") // want "missing errors.Is check for basic.NotFoundError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerCustom() {
+	err := GetResource("")
+	var notFoundErr *NotFoundError
+	if errors.As(err, &notFoundErr) {
+		println("not found:", notFoundErr.Resource)
+	}
+}

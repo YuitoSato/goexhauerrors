@@ -35,3 +35,39 @@ func NonPropagatingCaller() {
 		println(err.Error())
 	}
 }
+
+// PropagateError is a custom error type for propagation testing
+type PropagateError struct { // want PropagateError:`propagate.PropagateError`
+	Msg string
+}
+
+func (e *PropagateError) Error() string {
+	return "propagate error: " + e.Msg
+}
+
+func GetCustomError() error { // want GetCustomError:`\[propagate.PropagateError\]`
+	return &PropagateError{Msg: "custom"}
+}
+
+// PropagatingCallerCustom returns the custom error to caller - no check needed
+func PropagatingCallerCustom() error { // want PropagatingCallerCustom:`\[propagate.PropagateError\]`
+	err := GetCustomError()
+	return err // OK - propagating
+}
+
+// NonPropagatingCallerCustom does not return error - must check
+func NonPropagatingCallerCustom() {
+	err := GetCustomError() // want "missing errors.Is check for propagate.PropagateError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+// GoodCallerCustom properly checks for PropagateError
+func GoodCallerCustom() {
+	err := GetCustomError()
+	var propErr *PropagateError
+	if errors.As(err, &propErr) {
+		println("propagate error:", propErr.Msg)
+	}
+}

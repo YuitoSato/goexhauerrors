@@ -95,3 +95,43 @@ func WrongCheckAfterReassign() {
 		println("not found - wrong!")
 	}
 }
+
+// ReassignError is a custom error type for reassign testing
+type ReassignError struct { // want ReassignError:`reassign.ReassignError`
+	Code int
+}
+
+func (e *ReassignError) Error() string {
+	return "reassign error"
+}
+
+func GetCustom() error { // want GetCustom:`\[reassign.ReassignError\]`
+	return &ReassignError{Code: 1}
+}
+
+// ReassignCustomNoCheck: First call is checked, second (custom) is not
+func ReassignCustomNoCheck() {
+	err := GetItem()
+	if errors.Is(err, ErrNotFound) {
+		println("not found")
+	}
+
+	err = GetCustom() // want "missing errors.Is check for reassign.ReassignError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+// ReassignCustomAllChecked: Both calls are properly checked
+func ReassignCustomAllChecked() {
+	err := GetItem()
+	if errors.Is(err, ErrNotFound) {
+		println("not found")
+	}
+
+	err = GetCustom()
+	var reassignErr *ReassignError
+	if errors.As(err, &reassignErr) {
+		println("reassign error:", reassignErr.Code)
+	}
+}

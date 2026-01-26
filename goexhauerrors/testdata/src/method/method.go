@@ -53,3 +53,34 @@ func GoodDeleteCaller(s *Service) {
 		println("permission denied")
 	}
 }
+
+// MethodError is a custom error type
+type MethodError struct { // want MethodError:`method.MethodError`
+	Method string
+}
+
+func (e *MethodError) Error() string {
+	return "method error: " + e.Method
+}
+
+func (s *Service) UpdateItem(id string) error { // want UpdateItem:`\[method.MethodError\]`
+	if id == "" {
+		return &MethodError{Method: "UpdateItem"}
+	}
+	return nil
+}
+
+func BadCallerCustom(s *Service) {
+	err := s.UpdateItem("") // want "missing errors.Is check for method.MethodError"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerCustom(s *Service) {
+	err := s.UpdateItem("")
+	var methodErr *MethodError
+	if errors.As(err, &methodErr) {
+		println("method error:", methodErr.Method)
+	}
+}
