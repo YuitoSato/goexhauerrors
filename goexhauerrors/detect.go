@@ -11,12 +11,12 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 )
 
-// detectSentinelErrors finds sentinel errors in the current package and exports facts.
+// detectLocalErrors finds local errors in the current package and exports facts.
 // It detects:
-// 1. var Err* = errors.New("...") pattern
+// 1. var Err* = errors.New("...") pattern (sentinel errors)
 // 2. Custom error types (structs implementing error interface)
-func detectSentinelErrors(pass *analysis.Pass) *localSentinels {
-	result := newLocalSentinels()
+func detectLocalErrors(pass *analysis.Pass) *localErrors {
+	result := newLocalErrors()
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -30,7 +30,7 @@ func detectSentinelErrors(pass *analysis.Pass) *localSentinels {
 }
 
 // detectSentinelVars finds var Err* = errors.New("...") patterns.
-func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *localSentinels) {
+func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *localErrors) {
 	nodeFilter := []ast.Node{
 		(*ast.GenDecl)(nil),
 	}
@@ -69,7 +69,7 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 					if isSentinelInit(pass, valueSpec.Values[i]) {
 						result.vars[varObj] = true
 						// Export fact for cross-package analysis
-						fact := &SentinelErrorFact{
+						fact := &ErrorFact{
 							Name:    name.Name,
 							PkgPath: pass.Pkg.Path(),
 						}
@@ -82,7 +82,7 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 }
 
 // detectCustomErrorTypes finds struct types that implement the error interface.
-func detectCustomErrorTypes(pass *analysis.Pass, result *localSentinels) {
+func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 	errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
 
 	scope := pass.Pkg.Scope()
@@ -109,7 +109,7 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localSentinels) {
 
 			result.types[typeName] = true
 			// Export fact for cross-package analysis
-			fact := &SentinelErrorFact{
+			fact := &ErrorFact{
 				Name:    typeName.Name(),
 				PkgPath: pass.Pkg.Path(),
 			}

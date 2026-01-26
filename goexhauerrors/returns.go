@@ -18,11 +18,11 @@ type funcInfo struct {
 }
 
 // analyzeFunctionReturns analyzes all functions in the package and exports
-// FunctionSentinelsFact for each function that can return sentinel errors.
+// FunctionErrorsFact for each function that can return errors.
 // It uses iterative analysis to handle factory functions that call other
-// functions returning sentinels, combined with SSA-based analysis to track
+// functions returning errors, combined with SSA-based analysis to track
 // errors through variables.
-func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
+func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// Collect all function declarations
@@ -60,38 +60,38 @@ func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
 	})
 
 	// Track facts for local functions during iteration
-	localFacts := make(map[*types.Func]*FunctionSentinelsFact)
+	localFacts := make(map[*types.Func]*FunctionErrorsFact)
 
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
 	for {
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := newSSAAnalyzer(pass, sentinels, localFacts)
+		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts)
 
 		for _, fi := range funcs {
-			fact := &FunctionSentinelsFact{}
+			fact := &FunctionErrorsFact{}
 
 			// AST-based analysis
-			analyzeReturnsWithLocalFacts(pass, fi.body, fi.errorPositions, sentinels, fact, localFacts)
+			analyzeReturnsWithLocalFacts(pass, fi.body, fi.errorPositions, localErrs, fact, localFacts)
 
 			// SSA-based analysis to trace errors through variables
-			ssaSentinels := ssaAnalyzer.traceReturnStatements(fi.fn, fi.errorPositions)
-			for _, s := range ssaSentinels {
-				fact.AddSentinel(s)
+			ssaErrors := ssaAnalyzer.traceReturnStatements(fi.fn, fi.errorPositions)
+			for _, s := range ssaErrors {
+				fact.AddError(s)
 			}
 
 			existing := localFacts[fi.fn]
 			if existing == nil {
-				if len(fact.Sentinels) > 0 {
+				if len(fact.Errors) > 0 {
 					localFacts[fi.fn] = fact
 					changed = true
 				}
 			} else {
-				// Check if we found new sentinels
-				oldLen := len(existing.Sentinels)
+				// Check if we found new errors
+				oldLen := len(existing.Errors)
 				existing.Merge(fact)
-				if len(existing.Sentinels) > oldLen {
+				if len(existing.Errors) > oldLen {
 					changed = true
 				}
 			}
@@ -102,56 +102,56 @@ func analyzeFunctionReturns(pass *analysis.Pass, sentinels *localSentinels) {
 		}
 	}
 
-	// Build set of valid sentinels (local + imported with facts)
-	validSentinels := buildValidSentinels(pass, sentinels)
+	// Build set of valid errors (local + imported with facts)
+	validErrors := buildValidErrors(pass, localErrs)
 
-	// Export all discovered facts, filtering out invalid sentinels
+	// Export all discovered facts, filtering out invalid errors
 	for fn, fact := range localFacts {
-		fact.FilterByValidSentinels(validSentinels)
-		if len(fact.Sentinels) > 0 {
+		fact.FilterByValidErrors(validErrors)
+		if len(fact.Errors) > 0 {
 			pass.ExportObjectFact(fn, fact)
 		}
 	}
 }
 
-// buildValidSentinels creates a set of valid sentinel keys that can be used in FunctionSentinelsFact.
-// A sentinel is valid if:
-// 1. It's a local sentinel (var or type) in the current package
-// 2. It has an imported SentinelErrorFact
-func buildValidSentinels(pass *analysis.Pass, sentinels *localSentinels) map[string]bool {
+// buildValidErrors creates a set of valid error keys that can be used in FunctionErrorsFact.
+// A error is valid if:
+// 1. It's a local error (var or type) in the current package
+// 2. It has an imported ErrorFact
+func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bool {
 	valid := make(map[string]bool)
 
-	// Add local sentinel variables
-	for varObj := range sentinels.vars {
+	// Add local error variables
+	for varObj := range localErrs.vars {
 		key := pass.Pkg.Path() + "." + varObj.Name()
 		valid[key] = true
 	}
 
 	// Add local custom error types
-	for typeName := range sentinels.types {
+	for typeName := range localErrs.types {
 		key := pass.Pkg.Path() + "." + typeName.Name()
 		valid[key] = true
 	}
 
-	// Note: Imported sentinels are validated by checking ImportObjectFact during analysis
-	// We need to also allow imported sentinels that have facts
+	// Note: Imported errors are validated by checking ImportObjectFact during analysis
+	// We need to also allow imported errors that have facts
 	// This is done by scanning all referenced packages for exported facts
 	for _, imp := range pass.Pkg.Imports() {
 		scope := imp.Scope()
 		for _, name := range scope.Names() {
 			obj := scope.Lookup(name)
-			// Check for sentinel variable facts
+			// Check for error variable facts
 			if varObj, ok := obj.(*types.Var); ok {
-				var sentinelFact SentinelErrorFact
-				if pass.ImportObjectFact(varObj, &sentinelFact) {
-					valid[sentinelFact.Key()] = true
+				var errorFact ErrorFact
+				if pass.ImportObjectFact(varObj, &errorFact) {
+					valid[errorFact.Key()] = true
 				}
 			}
-			// Check for sentinel type facts
+			// Check for error type facts
 			if typeName, ok := obj.(*types.TypeName); ok {
-				var sentinelFact SentinelErrorFact
-				if pass.ImportObjectFact(typeName, &sentinelFact) {
-					valid[sentinelFact.Key()] = true
+				var errorFact ErrorFact
+				if pass.ImportObjectFact(typeName, &errorFact) {
+					valid[errorFact.Key()] = true
 				}
 			}
 		}
@@ -161,7 +161,7 @@ func buildValidSentinels(pass *analysis.Pass, sentinels *localSentinels) map[str
 }
 
 // analyzeReturnsWithLocalFacts is like analyzeReturns but also checks local function facts.
-func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, sentinels *localSentinels, fact *FunctionSentinelsFact, localFacts map[*types.Func]*FunctionSentinelsFact) {
+func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *localErrors, fact *FunctionErrorsFact, localFacts map[*types.Func]*FunctionErrorsFact) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
@@ -170,7 +170,7 @@ func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, erro
 
 		for _, pos := range errorPositions {
 			if pos < len(ret.Results) {
-				analyzeSentinelExprWithLocalFacts(pass, ret.Results[pos], sentinels, fact, false, localFacts)
+				analyzeErrorExprWithLocalFacts(pass, ret.Results[pos], localErrs, fact, false, localFacts)
 			}
 		}
 
@@ -178,8 +178,8 @@ func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, erro
 	})
 }
 
-// analyzeSentinelExprWithLocalFacts is like analyzeSentinelExpr but also checks local function facts.
-func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, sentinels *localSentinels, fact *FunctionSentinelsFact, wrapped bool, localFacts map[*types.Func]*FunctionSentinelsFact) {
+// analyzeErrorExprWithLocalFacts is like analyzeErrorExpr but also checks local function facts.
+func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool, localFacts map[*types.Func]*FunctionErrorsFact) {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		obj := pass.TypesInfo.Uses[e]
@@ -188,19 +188,19 @@ func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, senti
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			if sentinels.vars[varObj] {
-				fact.AddSentinel(SentinelInfo{
+			if localErrs.vars[varObj] {
+				fact.AddError(ErrorInfo{
 					PkgPath: pass.Pkg.Path(),
 					Name:    varObj.Name(),
 					Wrapped: wrapped,
 				})
 				return
 			}
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				fact.AddSentinel(SentinelInfo{
-					PkgPath: sentinelFact.PkgPath,
-					Name:    sentinelFact.Name,
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				fact.AddError(ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
 					Wrapped: wrapped,
 				})
 			}
@@ -213,11 +213,11 @@ func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, senti
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				fact.AddSentinel(SentinelInfo{
-					PkgPath: sentinelFact.PkgPath,
-					Name:    sentinelFact.Name,
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				fact.AddError(ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
 					Wrapped: wrapped,
 				})
 			}
@@ -225,12 +225,12 @@ func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, senti
 
 	case *ast.CallExpr:
 		if isFmtErrorfCall(pass, e) {
-			analyzeFmtErrorfCallWithLocalFacts(pass, e, sentinels, fact, localFacts)
+			analyzeFmtErrorfCallWithLocalFacts(pass, e, localErrs, fact, localFacts)
 			return
 		}
 
 		if compLit := extractCompositeLit(e); compLit != nil {
-			analyzeCompositeLit(pass, compLit, sentinels, fact, wrapped)
+			analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			return
 		}
 
@@ -242,7 +242,7 @@ func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, senti
 				fact.Merge(localFact)
 			}
 			// Also check imported facts (for cross-package or already exported)
-			var fnFact FunctionSentinelsFact
+			var fnFact FunctionErrorsFact
 			if pass.ImportObjectFact(calledFn, &fnFact) {
 				fact.Merge(&fnFact)
 			}
@@ -251,17 +251,17 @@ func analyzeSentinelExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, senti
 	case *ast.UnaryExpr:
 		if e.Op.String() == "&" {
 			if compLit, ok := e.X.(*ast.CompositeLit); ok {
-				analyzeCompositeLit(pass, compLit, sentinels, fact, wrapped)
+				analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			}
 		}
 
 	case *ast.CompositeLit:
-		analyzeCompositeLit(pass, e, sentinels, fact, wrapped)
+		analyzeCompositeLit(pass, e, localErrs, fact, wrapped)
 	}
 }
 
 // analyzeFmtErrorfCallWithLocalFacts is like analyzeFmtErrorfCall but uses local facts.
-func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr, sentinels *localSentinels, fact *FunctionSentinelsFact, localFacts map[*types.Func]*FunctionSentinelsFact) {
+func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr, localErrs *localErrors, fact *FunctionErrorsFact, localFacts map[*types.Func]*FunctionErrorsFact) {
 	if len(call.Args) < 1 {
 		return
 	}
@@ -281,7 +281,7 @@ func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr,
 		if argIdx >= len(call.Args) {
 			continue
 		}
-		analyzeSentinelExprWithLocalFacts(pass, call.Args[argIdx], sentinels, fact, true, localFacts)
+		analyzeErrorExprWithLocalFacts(pass, call.Args[argIdx], localErrs, fact, true, localFacts)
 	}
 }
 
@@ -298,7 +298,7 @@ func findErrorReturnPositions(sig *types.Signature) []int {
 }
 
 // analyzeReturns walks through the function body and analyzes return statements.
-func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, sentinels *localSentinels, fact *FunctionSentinelsFact) {
+func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *localErrors, fact *FunctionErrorsFact) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
@@ -308,7 +308,7 @@ func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []i
 		// Analyze each error return position
 		for _, pos := range errorPositions {
 			if pos < len(ret.Results) {
-				analyzeSentinelExpr(pass, ret.Results[pos], sentinels, fact, false)
+				analyzeErrorExpr(pass, ret.Results[pos], localErrs, fact, false)
 			}
 		}
 
@@ -316,72 +316,72 @@ func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []i
 	})
 }
 
-// analyzeSentinelExpr analyzes an expression to find sentinel errors.
-func analyzeSentinelExpr(pass *analysis.Pass, expr ast.Expr, sentinels *localSentinels, fact *FunctionSentinelsFact, wrapped bool) {
+// analyzeErrorExpr analyzes an expression to find errors.
+func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool) {
 	switch e := expr.(type) {
 	case *ast.Ident:
-		// Direct sentinel return: return ErrNotFound
+		// Direct error return: return ErrNotFound
 		obj := pass.TypesInfo.Uses[e]
 		if obj == nil {
 			return
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			// Check local sentinels
-			if sentinels.vars[varObj] {
-				fact.AddSentinel(SentinelInfo{
+			// Check local errors
+			if localErrs.vars[varObj] {
+				fact.AddError(ErrorInfo{
 					PkgPath: pass.Pkg.Path(),
 					Name:    varObj.Name(),
 					Wrapped: wrapped,
 				})
 				return
 			}
-			// Check imported sentinel via fact
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				fact.AddSentinel(SentinelInfo{
-					PkgPath: sentinelFact.PkgPath,
-					Name:    sentinelFact.Name,
+			// Check imported error via fact
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				fact.AddError(ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
 					Wrapped: wrapped,
 				})
 			}
 		}
 
 	case *ast.SelectorExpr:
-		// Qualified sentinel: return pkg.ErrNotFound
+		// Qualified error: return pkg.ErrNotFound
 		obj := pass.TypesInfo.Uses[e.Sel]
 		if obj == nil {
 			return
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				fact.AddSentinel(SentinelInfo{
-					PkgPath: sentinelFact.PkgPath,
-					Name:    sentinelFact.Name,
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				fact.AddError(ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
 					Wrapped: wrapped,
 				})
 			}
 		}
 
 	case *ast.CallExpr:
-		// Check for fmt.Errorf with %w wrapping a sentinel
+		// Check for fmt.Errorf with %w wrapping a error
 		if isFmtErrorfCall(pass, e) {
-			analyzeFmtErrorfCall(pass, e, sentinels, fact)
+			analyzeFmtErrorfCall(pass, e, localErrs, fact)
 			return
 		}
 
 		// Check for custom error type construction: &MyError{} or MyError{}
 		if compLit := extractCompositeLit(e); compLit != nil {
-			analyzeCompositeLit(pass, compLit, sentinels, fact, wrapped)
+			analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			return
 		}
 
-		// Check for function calls that might return sentinels
+		// Check for function calls that might return errors
 		calledFn := getCalledFunction(pass, e)
 		if calledFn != nil {
-			var fnFact FunctionSentinelsFact
+			var fnFact FunctionErrorsFact
 			if pass.ImportObjectFact(calledFn, &fnFact) {
 				fact.Merge(&fnFact)
 			}
@@ -391,13 +391,13 @@ func analyzeSentinelExpr(pass *analysis.Pass, expr ast.Expr, sentinels *localSen
 		// Handle &MyError{}
 		if e.Op.String() == "&" {
 			if compLit, ok := e.X.(*ast.CompositeLit); ok {
-				analyzeCompositeLit(pass, compLit, sentinels, fact, wrapped)
+				analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			}
 		}
 
 	case *ast.CompositeLit:
 		// Handle MyError{}
-		analyzeCompositeLit(pass, e, sentinels, fact, wrapped)
+		analyzeCompositeLit(pass, e, localErrs, fact, wrapped)
 	}
 }
 
@@ -416,7 +416,7 @@ func extractCompositeLit(call *ast.CallExpr) *ast.CompositeLit {
 }
 
 // analyzeCompositeLit checks if a composite literal is a custom error type.
-func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, sentinels *localSentinels, fact *FunctionSentinelsFact, wrapped bool) {
+func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool) {
 	// Get the type of the composite literal
 	tv := pass.TypesInfo.Types[compLit]
 	if !tv.IsValue() {
@@ -431,8 +431,8 @@ func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, sentine
 	typeName := namedType.Obj()
 
 	// Check local custom error types
-	if sentinels.types[typeName] {
-		fact.AddSentinel(SentinelInfo{
+	if localErrs.types[typeName] {
+		fact.AddError(ErrorInfo{
 			PkgPath: pass.Pkg.Path(),
 			Name:    typeName.Name(),
 			Wrapped: wrapped,
@@ -441,11 +441,11 @@ func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, sentine
 	}
 
 	// Check imported custom error types
-	var sentinelFact SentinelErrorFact
-	if pass.ImportObjectFact(typeName, &sentinelFact) {
-		fact.AddSentinel(SentinelInfo{
-			PkgPath: sentinelFact.PkgPath,
-			Name:    sentinelFact.Name,
+	var errorFact ErrorFact
+	if pass.ImportObjectFact(typeName, &errorFact) {
+		fact.AddError(ErrorInfo{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
 			Wrapped: wrapped,
 		})
 	}
@@ -489,8 +489,8 @@ func isFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 	return pkgName.Imported().Path() == "fmt"
 }
 
-// analyzeFmtErrorfCall analyzes fmt.Errorf calls for %w wrapped sentinels.
-func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, sentinels *localSentinels, fact *FunctionSentinelsFact) {
+// analyzeFmtErrorfCall analyzes fmt.Errorf calls for %w wrapped errors.
+func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, localErrs *localErrors, fact *FunctionErrorsFact) {
 	if len(call.Args) < 1 {
 		return
 	}
@@ -512,7 +512,7 @@ func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, sentinels *lo
 		if argIdx >= len(call.Args) {
 			continue
 		}
-		analyzeSentinelExpr(pass, call.Args[argIdx], sentinels, fact, true)
+		analyzeErrorExpr(pass, call.Args[argIdx], localErrs, fact, true)
 	}
 }
 
@@ -587,7 +587,7 @@ func getCalledFunction(pass *analysis.Pass, call *ast.CallExpr) *types.Func {
 
 // analyzeClosures finds closures assigned to variables and exports facts for them.
 // This handles patterns like: handler := func() error { return ErrX }
-func analyzeClosures(pass *analysis.Pass, sentinels *localSentinels) {
+func analyzeClosures(pass *analysis.Pass, localErrs *localErrors) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
@@ -598,15 +598,15 @@ func analyzeClosures(pass *analysis.Pass, sentinels *localSentinels) {
 	insp.Preorder(nodeFilter, func(n ast.Node) {
 		switch stmt := n.(type) {
 		case *ast.AssignStmt:
-			analyzeClosureAssignment(pass, stmt, sentinels)
+			analyzeClosureAssignment(pass, stmt, localErrs)
 		case *ast.ValueSpec:
-			analyzeClosureValueSpec(pass, stmt, sentinels)
+			analyzeClosureValueSpec(pass, stmt, localErrs)
 		}
 	})
 }
 
 // analyzeClosureAssignment handles: handler := func() error { ... }
-func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, sentinels *localSentinels) {
+func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localErrs *localErrors) {
 	for i, rhs := range stmt.Rhs {
 		funcLit, ok := rhs.(*ast.FuncLit)
 		if !ok {
@@ -638,19 +638,19 @@ func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, sentine
 			continue
 		}
 
-		// Analyze the closure body for sentinels
-		fact := &FunctionSentinelsFact{}
-		analyzeReturns(pass, funcLit.Body, errorPositions, sentinels, fact)
+		// Analyze the closure body for errors
+		fact := &FunctionErrorsFact{}
+		analyzeReturns(pass, funcLit.Body, errorPositions, localErrs, fact)
 
 		// Export fact attached to the variable
-		if len(fact.Sentinels) > 0 {
+		if len(fact.Errors) > 0 {
 			pass.ExportObjectFact(varObj, fact)
 		}
 	}
 }
 
 // analyzeClosureValueSpec handles: var handler = func() error { ... }
-func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, sentinels *localSentinels) {
+func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs *localErrors) {
 	for i, value := range spec.Values {
 		funcLit, ok := value.(*ast.FuncLit)
 		if !ok {
@@ -686,12 +686,12 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, sentinels
 			continue
 		}
 
-		// Analyze the closure body for sentinels
-		fact := &FunctionSentinelsFact{}
-		analyzeReturns(pass, funcLit.Body, errorPositions, sentinels, fact)
+		// Analyze the closure body for errors
+		fact := &FunctionErrorsFact{}
+		analyzeReturns(pass, funcLit.Body, errorPositions, localErrs, fact)
 
 		// Export fact attached to the variable
-		if len(fact.Sentinels) > 0 {
+		if len(fact.Errors) > 0 {
 			pass.ExportObjectFact(varObj, fact)
 		}
 	}

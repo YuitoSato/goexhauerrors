@@ -13,17 +13,17 @@ import (
 type ssaAnalyzer struct {
 	pass       *analysis.Pass
 	ssaResult  *buildssa.SSA
-	sentinels  *localSentinels
-	localFacts map[*types.Func]*FunctionSentinelsFact
+	localErrs  *localErrors
+	localFacts map[*types.Func]*FunctionErrorsFact
 }
 
 // newSSAAnalyzer creates a new SSA analyzer.
-func newSSAAnalyzer(pass *analysis.Pass, sentinels *localSentinels, localFacts map[*types.Func]*FunctionSentinelsFact) *ssaAnalyzer {
+func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact) *ssaAnalyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	return &ssaAnalyzer{
 		pass:       pass,
 		ssaResult:  ssaResult,
-		sentinels:  sentinels,
+		localErrs:  localErrs,
 		localFacts: localFacts,
 	}
 }
@@ -39,15 +39,15 @@ func (a *ssaAnalyzer) findSSAFunction(fn *types.Func) *ssa.Function {
 }
 
 // traceReturnStatements analyzes return statements in a function using SSA.
-// It returns additional sentinels discovered through SSA analysis by tracking
+// It returns additional errors discovered through SSA analysis by tracking
 // error values through local variables.
-func (a *ssaAnalyzer) traceReturnStatements(fn *types.Func, errorPositions []int) []SentinelInfo {
+func (a *ssaAnalyzer) traceReturnStatements(fn *types.Func, errorPositions []int) []ErrorInfo {
 	ssaFn := a.findSSAFunction(fn)
 	if ssaFn == nil {
 		return nil
 	}
 
-	var sentinels []SentinelInfo
+	var errs []ErrorInfo
 	visited := make(map[ssa.Value]bool)
 
 	// Iterate through all blocks and find Return instructions
@@ -61,74 +61,74 @@ func (a *ssaAnalyzer) traceReturnStatements(fn *types.Func, errorPositions []int
 			// Trace each error result
 			for _, pos := range errorPositions {
 				if pos < len(ret.Results) {
-					tracedSentinels := a.traceValueToSentinels(ret.Results[pos], visited, 0)
-					sentinels = append(sentinels, tracedSentinels...)
+					tracedErrs := a.traceValueToErrors(ret.Results[pos], visited, 0)
+					errs = append(errs, tracedErrs...)
 				}
 			}
 		}
 	}
 
-	return a.deduplicateSentinels(sentinels)
+	return a.deduplicateErrors(errs)
 }
 
 // maxTraceDepth limits recursion to prevent infinite loops and excessive tracing
 const maxTraceDepth = 10
 
-// traceValueToSentinels traces an SSA value back to its sentinel error sources.
-// It only follows specific patterns that are known to propagate sentinel errors:
-// - Function calls that have FunctionSentinelsFact
+// traceValueToErrors traces an SSA value back to its error sources.
+// It only follows specific patterns that are known to propagate errors:
+// - Function calls that have FunctionErrorsFact
 // - Phi nodes (conditional branches)
 // - Extract (multi-return value)
-// - Global variables that are sentinels
+// - Global variables that are errors
 // - MakeInterface with known custom error types
-func (a *ssaAnalyzer) traceValueToSentinels(val ssa.Value, visited map[ssa.Value]bool, depth int) []SentinelInfo {
+func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bool, depth int) []ErrorInfo {
 	if val == nil || visited[val] || depth > maxTraceDepth {
 		return nil
 	}
 	visited[val] = true
 
-	var sentinels []SentinelInfo
+	var errs []ErrorInfo
 
 	switch v := val.(type) {
 	case *ssa.Call:
-		// Function call result - get sentinels from the called function's facts only
-		callSentinels := a.getSentinelsFromCall(v)
-		sentinels = append(sentinels, callSentinels...)
+		// Function call result - get errors from the called function's facts only
+		callErrs := a.getErrorsFromCall(v)
+		errs = append(errs, callErrs...)
 		// Do NOT trace further into the call - this avoids picking up internal types
 
 	case *ssa.Extract:
 		// Extracting from a tuple (e.g., result of multi-return function)
 		// The tuple comes from a Call, so trace it
-		sentinels = append(sentinels, a.traceValueToSentinels(v.Tuple, visited, depth+1)...)
+		errs = append(errs, a.traceValueToErrors(v.Tuple, visited, depth+1)...)
 
 	case *ssa.Phi:
 		// Phi node - merge of values from different branches
 		for _, edge := range v.Edges {
-			sentinels = append(sentinels, a.traceValueToSentinels(edge, visited, depth+1)...)
+			errs = append(errs, a.traceValueToErrors(edge, visited, depth+1)...)
 		}
 
 	case *ssa.MakeInterface:
 		// Converting concrete type to interface
 		// Only add if it's a known custom error type (local or with fact)
-		sentinels = append(sentinels, a.getSentinelsFromMakeInterface(v)...)
+		errs = append(errs, a.getErrorsFromMakeInterface(v)...)
 		// Do NOT trace v.X further to avoid discovering internal types
 
 	case *ssa.UnOp:
 		if v.Op == token.MUL { // Dereference (load from pointer)
-			sentinels = append(sentinels, a.traceValueToSentinels(v.X, visited, depth+1)...)
+			errs = append(errs, a.traceValueToErrors(v.X, visited, depth+1)...)
 		}
 
 	case *ssa.Alloc:
 		// Allocation - only add if it's a known custom error type
-		sentinels = append(sentinels, a.getSentinelsFromAlloc(v)...)
+		errs = append(errs, a.getErrorsFromAlloc(v)...)
 
 	case *ssa.Global:
-		// Global variable - check if it's a known sentinel
-		sentinels = append(sentinels, a.getSentinelsFromGlobal(v)...)
+		// Global variable - check if it's a known error
+		errs = append(errs, a.getErrorsFromGlobal(v)...)
 
 	case *ssa.ChangeInterface:
 		// Interface conversion - trace underlying value
-		sentinels = append(sentinels, a.traceValueToSentinels(v.X, visited, depth+1)...)
+		errs = append(errs, a.traceValueToErrors(v.X, visited, depth+1)...)
 
 	case *ssa.Parameter:
 		// Function parameter - can't trace statically (known limitation)
@@ -144,13 +144,13 @@ func (a *ssaAnalyzer) traceValueToSentinels(val ssa.Value, visited map[ssa.Value
 	}
 
 	// Filter out any standard library types that might have slipped through
-	return filterStdlibSentinels(sentinels)
+	return filterStdlibErrors(errs)
 }
 
-// filterStdlibSentinels removes sentinels from standard library packages.
-func filterStdlibSentinels(sentinels []SentinelInfo) []SentinelInfo {
-	var filtered []SentinelInfo
-	for _, s := range sentinels {
+// filterStdlibErrors removes errors from standard library packages.
+func filterStdlibErrors(errs []ErrorInfo) []ErrorInfo {
+	var filtered []ErrorInfo
+	for _, s := range errs {
 		if !isStandardLibraryPackage(s.PkgPath) {
 			filtered = append(filtered, s)
 		}
@@ -158,10 +158,10 @@ func filterStdlibSentinels(sentinels []SentinelInfo) []SentinelInfo {
 	return filtered
 }
 
-// getSentinelsFromCall extracts sentinel information from a function call.
-// Only returns sentinels if the called function has FunctionSentinelsFact.
-func (a *ssaAnalyzer) getSentinelsFromCall(call *ssa.Call) []SentinelInfo {
-	var sentinels []SentinelInfo
+// getErrorsFromCall extracts error information from a function call.
+// Only returns errors if the called function has FunctionErrorsFact.
+func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
+	var errs []ErrorInfo
 
 	callee := call.Call.StaticCallee()
 	if callee == nil {
@@ -180,20 +180,20 @@ func (a *ssaAnalyzer) getSentinelsFromCall(call *ssa.Call) []SentinelInfo {
 
 	// Check local facts first (for same-package functions)
 	if localFact, ok := a.localFacts[typesFunc]; ok {
-		sentinels = append(sentinels, localFact.Sentinels...)
+		errs = append(errs, localFact.Errors...)
 	}
 
 	// Also check imported facts (for cross-package or already exported)
-	var fnFact FunctionSentinelsFact
+	var fnFact FunctionErrorsFact
 	if a.pass.ImportObjectFact(typesFunc, &fnFact) {
-		sentinels = append(sentinels, fnFact.Sentinels...)
+		errs = append(errs, fnFact.Errors...)
 	}
 
-	return sentinels
+	return errs
 }
 
 // isStandardLibraryPackage checks if a package path is a standard library package
-// that we should never consider for sentinel errors.
+// that we should never consider for errors.
 func isStandardLibraryPackage(pkgPath string) bool {
 	// Standard library packages we should ignore
 	stdlibPackages := map[string]bool{
@@ -207,10 +207,10 @@ func isStandardLibraryPackage(pkgPath string) bool {
 	return stdlibPackages[pkgPath]
 }
 
-// getSentinelsFromMakeInterface checks if a MakeInterface creates a known custom error type.
-// Only returns sentinels if the type is explicitly registered as a sentinel type.
-func (a *ssaAnalyzer) getSentinelsFromMakeInterface(v *ssa.MakeInterface) []SentinelInfo {
-	var sentinels []SentinelInfo
+// getErrorsFromMakeInterface checks if a MakeInterface creates a known custom error type.
+// Only returns errors if the type is explicitly registered as a error type.
+func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorInfo {
+	var errs []ErrorInfo
 
 	// Get the concrete type being converted to interface
 	concreteType := v.X.Type()
@@ -239,32 +239,32 @@ func (a *ssaAnalyzer) getSentinelsFromMakeInterface(v *ssa.MakeInterface) []Sent
 
 	// Check if it's a local custom error type (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.sentinels.types[typeName] {
-			sentinels = append(sentinels, SentinelInfo{
+		if a.localErrs.types[typeName] {
+			errs = append(errs, ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    typeName.Name(),
 				Wrapped: false,
 			})
 		}
-		return sentinels
+		return errs
 	}
 
 	// For imported types, only use if they have an explicit fact
-	var sentinelFact SentinelErrorFact
-	if a.pass.ImportObjectFact(typeName, &sentinelFact) {
-		sentinels = append(sentinels, SentinelInfo{
-			PkgPath: sentinelFact.PkgPath,
-			Name:    sentinelFact.Name,
+	var errorFact ErrorFact
+	if a.pass.ImportObjectFact(typeName, &errorFact) {
+		errs = append(errs, ErrorInfo{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
 			Wrapped: false,
 		})
 	}
 
-	return sentinels
+	return errs
 }
 
-// getSentinelsFromAlloc checks if an Alloc creates a known custom error type.
-func (a *ssaAnalyzer) getSentinelsFromAlloc(v *ssa.Alloc) []SentinelInfo {
-	var sentinels []SentinelInfo
+// getErrorsFromAlloc checks if an Alloc creates a known custom error type.
+func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
+	var errs []ErrorInfo
 
 	allocType := v.Type()
 	// Alloc returns a pointer
@@ -296,32 +296,32 @@ func (a *ssaAnalyzer) getSentinelsFromAlloc(v *ssa.Alloc) []SentinelInfo {
 
 	// Check if it's a local custom error type (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.sentinels.types[typeName] {
-			sentinels = append(sentinels, SentinelInfo{
+		if a.localErrs.types[typeName] {
+			errs = append(errs, ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    typeName.Name(),
 				Wrapped: false,
 			})
 		}
-		return sentinels
+		return errs
 	}
 
 	// For imported types, only use if they have an explicit fact
-	var sentinelFact SentinelErrorFact
-	if a.pass.ImportObjectFact(typeName, &sentinelFact) {
-		sentinels = append(sentinels, SentinelInfo{
-			PkgPath: sentinelFact.PkgPath,
-			Name:    sentinelFact.Name,
+	var errorFact ErrorFact
+	if a.pass.ImportObjectFact(typeName, &errorFact) {
+		errs = append(errs, ErrorInfo{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
 			Wrapped: false,
 		})
 	}
 
-	return sentinels
+	return errs
 }
 
-// getSentinelsFromGlobal checks if a Global is a known sentinel error.
-func (a *ssaAnalyzer) getSentinelsFromGlobal(v *ssa.Global) []SentinelInfo {
-	var sentinels []SentinelInfo
+// getErrorsFromGlobal checks if a Global is a known error error.
+func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
+	var errs []ErrorInfo
 
 	obj := v.Object()
 	if obj == nil {
@@ -344,36 +344,36 @@ func (a *ssaAnalyzer) getSentinelsFromGlobal(v *ssa.Global) []SentinelInfo {
 		return nil
 	}
 
-	// Check if it's a local sentinel (same package)
+	// Check if it's a local error (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.sentinels.vars[varObj] {
-			sentinels = append(sentinels, SentinelInfo{
+		if a.localErrs.vars[varObj] {
+			errs = append(errs, ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    varObj.Name(),
 				Wrapped: false,
 			})
 		}
-		return sentinels
+		return errs
 	}
 
 	// For imported variables, only use if they have an explicit fact
-	var sentinelFact SentinelErrorFact
-	if a.pass.ImportObjectFact(varObj, &sentinelFact) {
-		sentinels = append(sentinels, SentinelInfo{
-			PkgPath: sentinelFact.PkgPath,
-			Name:    sentinelFact.Name,
+	var errorFact ErrorFact
+	if a.pass.ImportObjectFact(varObj, &errorFact) {
+		errs = append(errs, ErrorInfo{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
 			Wrapped: false,
 		})
 	}
 
-	return sentinels
+	return errs
 }
 
-// deduplicateSentinels removes duplicate sentinels from the list.
-func (a *ssaAnalyzer) deduplicateSentinels(sentinels []SentinelInfo) []SentinelInfo {
+// deduplicateErrors removes duplicate errors from the list.
+func (a *ssaAnalyzer) deduplicateErrors(errs []ErrorInfo) []ErrorInfo {
 	seen := make(map[string]bool)
-	var result []SentinelInfo
-	for _, s := range sentinels {
+	var result []ErrorInfo
+	for _, s := range errs {
 		key := s.Key()
 		if !seen[key] {
 			seen[key] = true

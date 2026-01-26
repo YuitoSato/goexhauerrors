@@ -10,7 +10,7 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 )
 
-// checkCallSites checks all call sites to ensure sentinel errors are properly checked.
+// checkCallSites checks all call sites to ensure errors are properly checked.
 func checkCallSites(pass *analysis.Pass) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -52,11 +52,11 @@ func funcReturnsError(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
 	return false
 }
 
-// errorVarState tracks the active sentinels for an error variable.
+// errorVarState tracks the active errors for an error variable.
 type errorVarState struct {
-	callPos   token.Pos
-	sentinels []SentinelInfo
-	checked   map[string]bool
+	callPos token.Pos
+	errors  []ErrorInfo
+	checked map[string]bool
 }
 
 // checkFunctionBody checks all call sites within a function body using flow-sensitive analysis.
@@ -67,9 +67,9 @@ func checkFunctionBody(pass *analysis.Pass, body *ast.BlockStmt, canPropagate bo
 	// Walk statements in order for flow-sensitive analysis
 	walkStatementsWithScope(pass, body.List, states, canPropagate)
 
-	// Report any remaining unchecked sentinels at end of function
+	// Report any remaining unchecked errors at end of function
 	for _, state := range states {
-		reportUncheckedSentinels(pass, state)
+		reportUncheckedErrors(pass, state)
 	}
 }
 
@@ -96,8 +96,8 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 				continue
 			}
 
-			fnFact, sig := getCallSentinels(pass, call)
-			if fnFact == nil || len(fnFact.Sentinels) == 0 {
+			fnFact, sig := getCallErrors(pass, call)
+			if fnFact == nil || len(fnFact.Errors) == 0 {
 				continue
 			}
 
@@ -106,15 +106,15 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 				continue
 			}
 
-			// If this variable already has active sentinels, report unchecked ones
+			// If this variable already has active errors, report unchecked ones
 			if existingState, ok := states[errorVar]; ok {
-				reportUncheckedSentinels(pass, existingState)
+				reportUncheckedErrors(pass, existingState)
 			}
 
 			// Set new state for this variable
 			states[errorVar] = &errorVarState{
 				callPos:   call.Pos(),
-				sentinels: fnFact.Sentinels,
+				errors: fnFact.Errors,
 				checked:   make(map[string]bool),
 			}
 		}
@@ -149,7 +149,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			}
 		}
 
-		// Merge states: mark sentinels as checked if checked in BOTH branches
+		// Merge states: mark errors as checked if checked in BOTH branches
 		mergeStates(states, ifStates, elseStates)
 
 	case *ast.SwitchStmt:
@@ -170,7 +170,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 					// Walk case body
 					caseStates := cloneStates(states)
 					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
-					// Merge back checked sentinels
+					// Merge back checked errors
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
 							for key := range caseState.checked {
@@ -188,9 +188,9 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			for _, result := range s.Results {
 				if referencesVariable(pass, result, varObj) {
 					if canPropagate {
-						// Mark all sentinels as "checked" since we're propagating
-						for _, sentinel := range state.sentinels {
-							state.checked[sentinel.Key()] = true
+						// Mark all errors as "checked" since we're propagating
+						for _, errInfo := range state.errors {
+							state.checked[errInfo.Key()] = true
 						}
 					}
 				}
@@ -229,8 +229,8 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 							continue
 						}
 
-						fnFact, _ := getCallSentinels(pass, call)
-						if fnFact == nil || len(fnFact.Sentinels) == 0 {
+						fnFact, _ := getCallErrors(pass, call)
+						if fnFact == nil || len(fnFact.Errors) == 0 {
 							continue
 						}
 
@@ -240,7 +240,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 								if isErrorType(varObj.Type()) {
 									states[varObj] = &errorVarState{
 										callPos:   call.Pos(),
-										sentinels: fnFact.Sentinels,
+										errors: fnFact.Errors,
 										checked:   make(map[string]bool),
 									}
 								}
@@ -253,7 +253,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 	}
 }
 
-// collectErrorsIsInExpr finds errors.Is/As calls in an expression and marks sentinels as checked.
+// collectErrorsIsInExpr finds errors.Is/As calls in an expression and marks errors as checked.
 func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types.Var]*errorVarState) {
 	ast.Inspect(expr, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -266,9 +266,9 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 				// Find which error variable is being checked
 				for varObj, state := range states {
 					if referencesVariable(pass, call.Args[0], varObj) {
-						sentinelKey := extractSentinelKey(pass, call.Args[1])
-						if sentinelKey != "" {
-							state.checked[sentinelKey] = true
+						errorKey := extractErrorKey(pass, call.Args[1])
+						if errorKey != "" {
+							state.checked[errorKey] = true
 						}
 					}
 				}
@@ -279,9 +279,9 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 			if len(call.Args) >= 2 {
 				for varObj, state := range states {
 					if referencesVariable(pass, call.Args[0], varObj) {
-						sentinelKey := extractSentinelKeyFromAsTarget(pass, call.Args[1])
-						if sentinelKey != "" {
-							state.checked[sentinelKey] = true
+						errorKey := extractErrorKeyFromAsTarget(pass, call.Args[1])
+						if errorKey != "" {
+							state.checked[errorKey] = true
 						}
 					}
 				}
@@ -292,10 +292,10 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 	})
 }
 
-// reportUncheckedSentinels reports any sentinels that haven't been checked.
-func reportUncheckedSentinels(pass *analysis.Pass, state *errorVarState) {
-	for _, sentinel := range state.sentinels {
-		key := sentinel.Key()
+// reportUncheckedErrors reports any errors that haven't been checked.
+func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
+	for _, errInfo := range state.errors {
+		key := errInfo.Key()
 		if !state.checked[key] {
 			pass.Reportf(state.callPos, "missing errors.Is check for %s", key)
 		}
@@ -311,24 +311,24 @@ func cloneStates(states map[*types.Var]*errorVarState) map[*types.Var]*errorVarS
 			newChecked[k] = v
 		}
 		result[varObj] = &errorVarState{
-			callPos:   state.callPos,
-			sentinels: state.sentinels, // Slice is fine to share as we don't modify it
-			checked:   newChecked,
+			callPos: state.callPos,
+			errors:  state.errors, // Slice is fine to share as we don't modify it
+			checked: newChecked,
 		}
 	}
 	return result
 }
 
 // mergeStates merges branch states back into the main states.
-// A sentinel is considered checked if it's checked in EITHER branch (conservative approach).
+// A error is considered checked if it's checked in EITHER branch (conservative approach).
 func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[*types.Var]*errorVarState) {
 	for varObj, state := range states {
 		ifState := ifStates[varObj]
 		elseState := elseStates[varObj]
 
-		// A sentinel is checked if checked in either branch
-		for _, sentinel := range state.sentinels {
-			key := sentinel.Key()
+		// A error is checked if checked in either branch
+		for _, errInfo := range state.errors {
+			key := errInfo.Key()
 			checkedInIf := ifState != nil && ifState.checked[key]
 			checkedInElse := elseState != nil && elseState.checked[key]
 			if checkedInIf || checkedInElse {
@@ -338,13 +338,13 @@ func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[
 	}
 }
 
-// getCallSentinels returns the FunctionSentinelsFact and signature for a call expression.
+// getCallErrors returns the FunctionErrorsFact and signature for a call expression.
 // It handles both regular function calls and closure variable calls.
-func getCallSentinels(pass *analysis.Pass, call *ast.CallExpr) (*FunctionSentinelsFact, *types.Signature) {
+func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact, *types.Signature) {
 	// First, try to get it as a regular function
 	calledFn := getCalledFunction(pass, call)
 	if calledFn != nil {
-		var fnFact FunctionSentinelsFact
+		var fnFact FunctionErrorsFact
 		if pass.ImportObjectFact(calledFn, &fnFact) {
 			return &fnFact, calledFn.Type().(*types.Signature)
 		}
@@ -363,8 +363,8 @@ func getCallSentinels(pass *analysis.Pass, call *ast.CallExpr) (*FunctionSentine
 		return nil, nil
 	}
 
-	// Check if the variable has a FunctionSentinelsFact
-	var fnFact FunctionSentinelsFact
+	// Check if the variable has a FunctionErrorsFact
+	var fnFact FunctionErrorsFact
 	if pass.ImportObjectFact(varObj, &fnFact) {
 		// Get the signature from the variable's type
 		sig, ok := varObj.Type().Underlying().(*types.Signature)
@@ -458,9 +458,9 @@ func isErrorsPkgCall(pass *analysis.Pass, call *ast.CallExpr, funcName string) b
 	return pkgName.Imported().Path() == "errors"
 }
 
-// extractSentinelKeyFromAsTarget extracts the sentinel key from errors.As target.
+// extractErrorKeyFromAsTarget extracts the error key from errors.As target.
 // errors.As(err, &target) where target is *SomeErrorType
-func extractSentinelKeyFromAsTarget(pass *analysis.Pass, expr ast.Expr) string {
+func extractErrorKeyFromAsTarget(pass *analysis.Pass, expr ast.Expr) string {
 	// errors.As takes a pointer to the target, so we need to get the underlying type
 	tv := pass.TypesInfo.Types[expr]
 	if !tv.IsValue() {
@@ -480,9 +480,9 @@ func extractSentinelKeyFromAsTarget(pass *analysis.Pass, expr ast.Expr) string {
 	if innerPtr, ok := elemType.(*types.Pointer); ok {
 		if named, ok := innerPtr.Elem().(*types.Named); ok {
 			typeName := named.Obj()
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(typeName, &sentinelFact) {
-				return sentinelFact.PkgPath + "." + sentinelFact.Name
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(typeName, &errorFact) {
+				return errorFact.PkgPath + "." + errorFact.Name
 			}
 			if typeName.Pkg() != nil {
 				return typeName.Pkg().Path() + "." + typeName.Name()
@@ -493,9 +493,9 @@ func extractSentinelKeyFromAsTarget(pass *analysis.Pass, expr ast.Expr) string {
 	// If it's a named type directly (non-pointer error type)
 	if named, ok := elemType.(*types.Named); ok {
 		typeName := named.Obj()
-		var sentinelFact SentinelErrorFact
-		if pass.ImportObjectFact(typeName, &sentinelFact) {
-			return sentinelFact.PkgPath + "." + sentinelFact.Name
+		var errorFact ErrorFact
+		if pass.ImportObjectFact(typeName, &errorFact) {
+			return errorFact.PkgPath + "." + errorFact.Name
 		}
 		if typeName.Pkg() != nil {
 			return typeName.Pkg().Path() + "." + typeName.Name()
@@ -523,17 +523,17 @@ func referencesVariable(pass *analysis.Pass, expr ast.Expr, targetVar *types.Var
 	return found
 }
 
-// extractSentinelKey extracts the sentinel key from an errors.Is second argument.
-func extractSentinelKey(pass *analysis.Pass, expr ast.Expr) string {
+// extractErrorKey extracts the error key from an errors.Is second argument.
+func extractErrorKey(pass *analysis.Pass, expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		obj := pass.TypesInfo.Uses[e]
 		if varObj, ok := obj.(*types.Var); ok {
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				return sentinelFact.PkgPath + "." + sentinelFact.Name
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				return errorFact.PkgPath + "." + errorFact.Name
 			}
-			// For local sentinels in same package
+			// For local errors in same package
 			if varObj.Pkg() != nil {
 				return varObj.Pkg().Path() + "." + varObj.Name()
 			}
@@ -542,9 +542,9 @@ func extractSentinelKey(pass *analysis.Pass, expr ast.Expr) string {
 	case *ast.SelectorExpr:
 		obj := pass.TypesInfo.Uses[e.Sel]
 		if varObj, ok := obj.(*types.Var); ok {
-			var sentinelFact SentinelErrorFact
-			if pass.ImportObjectFact(varObj, &sentinelFact) {
-				return sentinelFact.PkgPath + "." + sentinelFact.Name
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				return errorFact.PkgPath + "." + errorFact.Name
 			}
 			if varObj.Pkg() != nil {
 				return varObj.Pkg().Path() + "." + varObj.Name()
