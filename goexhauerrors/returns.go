@@ -773,6 +773,12 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 		// For each method in the interface
 		for i := 0; i < ifaceType.NumMethods(); i++ {
 			ifaceMethod := ifaceType.Method(i)
+
+			// Skip methods from embedded interfaces (they belong to other packages)
+			if ifaceMethod.Pkg() != pass.Pkg {
+				continue
+			}
+
 			fact := &InterfaceMethodFact{}
 
 			// Collect errors from all implementations
