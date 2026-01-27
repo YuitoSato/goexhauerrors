@@ -8,6 +8,14 @@ import (
 	"golang.org/x/tools/go/analysis/passes/inspect"
 )
 
+// ignorePackages is a comma-separated list of package paths to ignore.
+var ignorePackages string
+
+func init() {
+	Analyzer.Flags.StringVar(&ignorePackages, "ignorePackages", "",
+		"comma-separated list of package paths to ignore (e.g., gorm.io/gorm,database/sql)")
+}
+
 var Analyzer = &analysis.Analyzer{
 	Name: "exhaustiveerrors",
 	Doc:  "checks that all error types returned by functions are exhaustively checked with errors.Is/As",

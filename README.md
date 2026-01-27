@@ -339,15 +339,32 @@ func caller() {
 }
 ```
 
-### External Packages (stdlib)
+### Ignoring Packages
+
+You can exclude specific packages from error checking using the `-ignorePackages` flag:
+
+```bash
+goexhauerrors -ignorePackages="gorm.io/gorm,database/sql" ./...
+```
+
+This is useful for excluding standard library or third-party package errors:
 
 ```go
-import "database/sql"
+import (
+    "database/sql"
+    "gorm.io/gorm"
+)
 
 func Query() error {
-    return sql.ErrNoRows  // No fact exported from stdlib
+    return sql.ErrNoRows  // Ignored if "database/sql" is in ignorePackages
+}
+
+func FindUser() error {
+    return gorm.ErrRecordNotFound  // Ignored if "gorm.io/gorm" is in ignorePackages
 }
 ```
+
+External errors should be converted to your domain errors at API boundaries.
 
 ### Dynamic Error Creation
 
@@ -377,7 +394,7 @@ func CreateError(msg string) error {
 | | Higher-order functions (lambda) | Yes |
 | Not Supported | Unexported errors | No (by design) |
 | | Struct/map field storage | No |
-| | External packages (stdlib) | No |
+| | Ignored packages | No (use -ignorePackages flag) |
 | | Dynamic error creation | No |
 
 ## Usage
@@ -386,6 +403,18 @@ func CreateError(msg string) error {
 
 ```bash
 goexhauerrors ./...
+```
+
+### Ignoring Packages
+
+Use the `-ignorePackages` flag to exclude specific packages from error checking:
+
+```bash
+# Ignore a single package
+goexhauerrors -ignorePackages="gorm.io/gorm" ./...
+
+# Ignore multiple packages (comma-separated)
+goexhauerrors -ignorePackages="gorm.io/gorm,database/sql,strconv" ./...
 ```
 
 ### golangci-lint (Plugin)

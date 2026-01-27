@@ -295,6 +295,10 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 // reportUncheckedErrors reports any errors that haven't been checked.
 func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
 	for _, errInfo := range state.errors {
+		// Skip ignored packages
+		if shouldIgnorePackage(errInfo.PkgPath) {
+			continue
+		}
 		key := errInfo.Key()
 		if !state.checked[key] {
 			pass.Reportf(state.callPos, "missing errors.Is check for %s", key)

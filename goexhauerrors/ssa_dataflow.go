@@ -151,15 +151,15 @@ func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bo
 		// Map lookup - don't trace (known limitation)
 	}
 
-	// Filter out any standard library types that might have slipped through
-	return filterStdlibErrors(errs)
+	// Filter out any external package types (including stdlib)
+	return a.filterIgnoredPackages(errs)
 }
 
-// filterStdlibErrors removes errors from standard library packages.
-func filterStdlibErrors(errs []ErrorInfo) []ErrorInfo {
+// filterIgnoredPackages removes errors from ignored packages.
+func (a *ssaAnalyzer) filterIgnoredPackages(errs []ErrorInfo) []ErrorInfo {
 	var filtered []ErrorInfo
 	for _, s := range errs {
-		if !isStandardLibraryPackage(s.PkgPath) {
+		if !shouldIgnorePackage(s.PkgPath) {
 			filtered = append(filtered, s)
 		}
 	}
@@ -249,21 +249,6 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 	return a.deduplicateErrors(allErrors)
 }
 
-// isStandardLibraryPackage checks if a package path is a standard library package
-// that we should never consider for errors.
-func isStandardLibraryPackage(pkgPath string) bool {
-	// Standard library packages we should ignore
-	stdlibPackages := map[string]bool{
-		"errors": true,
-		"fmt":    true,
-		"io":     true,
-		"os":     true,
-		"net":    true,
-		"time":   true,
-	}
-	return stdlibPackages[pkgPath]
-}
-
 // getErrorsFromMakeInterface checks if a MakeInterface creates a known custom error type.
 // Only returns errors if the type is explicitly registered as a error type.
 func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorInfo {
@@ -289,8 +274,8 @@ func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorIn
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibraryPackage(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
@@ -346,8 +331,8 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibraryPackage(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
@@ -396,8 +381,8 @@ func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibraryPackage(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 

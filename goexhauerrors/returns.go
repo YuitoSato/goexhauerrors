@@ -172,7 +172,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 // buildValidErrors creates a set of valid error keys that can be used in FunctionErrorsFact.
 // A error is valid if:
 // 1. It's a local error (var or type) in the current package
-// 2. It has an imported ErrorFact
+// 2. It has an imported ErrorFact (excluding ignored packages)
 func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bool {
 	valid := make(map[string]bool)
 
@@ -192,6 +192,11 @@ func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bo
 	// We need to also allow imported errors that have facts
 	// This is done by scanning all referenced packages for exported facts
 	for _, imp := range pass.Pkg.Imports() {
+		// Skip ignored packages
+		if shouldIgnorePackage(imp.Path()) {
+			continue
+		}
+
 		scope := imp.Scope()
 		for _, name := range scope.Names() {
 			obj := scope.Lookup(name)
