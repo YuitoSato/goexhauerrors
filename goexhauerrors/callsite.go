@@ -354,6 +354,14 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 			result.Merge(&fnFact)
 		}
 
+		// Also check for InterfaceMethodFact (for interface method calls)
+		var ifaceFact InterfaceMethodFact
+		if pass.ImportObjectFact(calledFn, &ifaceFact) {
+			for _, err := range ifaceFact.Errors {
+				result.AddError(err)
+			}
+		}
+
 		// Also resolve errors through ParameterFlowFact
 		var flowFact ParameterFlowFact
 		if pass.ImportObjectFact(calledFn, &flowFact) {
@@ -366,7 +374,22 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 		if len(result.Errors) > 0 {
 			return result, sig
 		}
+
+		// If no facts found yet, check if this is an interface method and look for implementations
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			if fact, _ := getInterfaceMethodErrors(pass, sel); fact != nil && len(fact.Errors) > 0 {
+				return fact, sig
+			}
+		}
+
 		return nil, nil
+	}
+
+	// Check for interface method call (selector expression on interface type)
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		if fact, sig := getInterfaceMethodErrors(pass, sel); fact != nil {
+			return fact, sig
+		}
 	}
 
 	// Try to get it as a closure variable
@@ -390,6 +413,64 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 			return nil, nil
 		}
 		return &fnFact, sig
+	}
+
+	return nil, nil
+}
+
+// getInterfaceMethodErrors returns errors from an interface method call.
+// It checks if the receiver is an interface type and returns the InterfaceMethodFact.
+func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*FunctionErrorsFact, *types.Signature) {
+	// Check if the receiver is an interface type
+	tv := pass.TypesInfo.Types[sel.X]
+	if !tv.IsValue() {
+		return nil, nil
+	}
+
+	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
+	if !ok {
+		return nil, nil
+	}
+
+	// Get the method object
+	methodObj := pass.TypesInfo.Uses[sel.Sel]
+	method, ok := methodObj.(*types.Func)
+	if !ok {
+		return nil, nil
+	}
+
+	// Get the method signature
+	sig, ok := method.Type().(*types.Signature)
+	if !ok {
+		return nil, nil
+	}
+
+	// Check for InterfaceMethodFact
+	var ifaceFact InterfaceMethodFact
+	if pass.ImportObjectFact(method, &ifaceFact) {
+		return &FunctionErrorsFact{Errors: ifaceFact.Errors}, sig
+	}
+
+	// If no fact found, try to find implementations in the current package
+	// This handles the case where the interface and implementations are in the same package
+	impls := findInterfaceImplementations(pass)
+	implementingTypes := impls.getImplementingTypes(ifaceType)
+
+	result := &FunctionErrorsFact{}
+	for _, concreteType := range implementingTypes {
+		concreteMethod := findMethodImplementation(concreteType, method)
+		if concreteMethod == nil {
+			continue
+		}
+
+		var fnFact FunctionErrorsFact
+		if pass.ImportObjectFact(concreteMethod, &fnFact) {
+			result.Merge(&fnFact)
+		}
+	}
+
+	if len(result.Errors) > 0 {
+		return result, sig
 	}
 
 	return nil, nil

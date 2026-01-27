@@ -24,7 +24,7 @@ func TestFunctionParameter() {
 // =============================================================================
 
 type ErrorReturner interface {
-	GetError() error
+	GetError() error // want GetError:`\[limitations.ErrTest\]`
 }
 
 type MyReturner struct{}
@@ -42,10 +42,17 @@ func TestConcreteType() {
 }
 
 func TestInterfaceParameter(r ErrorReturner) {
-	// Should NOT warn - interface implementation unknown
-	err := r.GetError()
+	// NOW WARNS - all implementations' errors are collected
+	err := r.GetError() // want "missing errors.Is check for limitations.ErrTest"
 	if err != nil {
 		println(err.Error())
+	}
+}
+
+func TestInterfaceParameterGood(r ErrorReturner) {
+	err := r.GetError()
+	if errors.Is(err, ErrTest) {
+		println("test error")
 	}
 }
 

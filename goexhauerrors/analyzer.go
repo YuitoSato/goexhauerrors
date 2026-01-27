@@ -20,6 +20,7 @@ var Analyzer = &analysis.Analyzer{
 		(*ErrorFact)(nil),
 		(*FunctionErrorsFact)(nil),
 		(*ParameterFlowFact)(nil),
+		(*InterfaceMethodFact)(nil),
 	},
 }
 

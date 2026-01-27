@@ -25,6 +25,9 @@ type funcInfo struct {
 func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
+	// Discover interface implementations in this package
+	interfaceImpls := findInterfaceImplementations(pass)
+
 	// Collect all function declarations
 	var funcs []funcInfo
 	nodeFilter := []ast.Node{
@@ -68,7 +71,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts)
+		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
 
 		for _, fi := range funcs {
 			// Phase A: Detect parameter flow
@@ -137,6 +140,9 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 			pass.ExportObjectFact(fn, fact)
 		}
 	}
+
+	// Compute and export InterfaceMethodFact for interface methods
+	computeInterfaceMethodFacts(pass, localFacts, interfaceImpls)
 }
 
 // buildValidErrors creates a set of valid error keys that can be used in FunctionErrorsFact.
@@ -718,6 +724,57 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 		// Export fact attached to the variable
 		if len(fact.Errors) > 0 {
 			pass.ExportObjectFact(varObj, fact)
+		}
+	}
+}
+
+// computeInterfaceMethodFacts computes and exports InterfaceMethodFact for each
+// interface method in the package. It collects errors from all known implementations.
+func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*FunctionErrorsFact, impls *interfaceImplementations) {
+	scope := pass.Pkg.Scope()
+
+	// For each interface defined in this package
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		typeName, ok := obj.(*types.TypeName)
+		if !ok {
+			continue
+		}
+
+		ifaceType, ok := typeName.Type().Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+
+		// For each method in the interface
+		for i := 0; i < ifaceType.NumMethods(); i++ {
+			ifaceMethod := ifaceType.Method(i)
+			fact := &InterfaceMethodFact{}
+
+			// Collect errors from all implementations
+			implementingTypes := impls.getImplementingTypes(ifaceType)
+			for _, concreteType := range implementingTypes {
+				method := findMethodImplementation(concreteType, ifaceMethod)
+				if method == nil {
+					continue
+				}
+
+				// Check local facts first
+				if localFact, ok := localFacts[method]; ok {
+					fact.AddErrors(localFact.Errors)
+				}
+
+				// Also check imported facts
+				var fnFact FunctionErrorsFact
+				if pass.ImportObjectFact(method, &fnFact) {
+					fact.AddErrors(fnFact.Errors)
+				}
+			}
+
+			// Export the fact if we found any errors
+			if len(fact.Errors) > 0 {
+				pass.ExportObjectFact(ifaceMethod, fact)
+			}
 		}
 	}
 }

@@ -6,6 +6,7 @@ func init() {
 	gob.Register(&ErrorFact{})
 	gob.Register(&FunctionErrorsFact{})
 	gob.Register(&ParameterFlowFact{})
+	gob.Register(&InterfaceMethodFact{})
 }
 
 // ErrorFact marks a variable or type as an error.
@@ -141,5 +142,46 @@ func (f *ParameterFlowFact) AddFlow(flow ParameterFlowInfo) {
 func (f *ParameterFlowFact) Merge(other *ParameterFlowFact) {
 	for _, flow := range other.Flows {
 		f.AddFlow(flow)
+	}
+}
+
+// InterfaceMethodFact stores all errors that implementations of an interface method can return.
+// Attached to *types.Func objects representing interface methods.
+type InterfaceMethodFact struct {
+	Errors []ErrorInfo // Union of errors from all implementations
+}
+
+func (*InterfaceMethodFact) AFact() {}
+
+func (f *InterfaceMethodFact) String() string {
+	if len(f.Errors) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, s := range f.Errors {
+		if i > 0 {
+			result += ", "
+		}
+		result += s.Key()
+	}
+	result += "]"
+	return result
+}
+
+// AddError adds an error to the fact if not already present.
+func (f *InterfaceMethodFact) AddError(info ErrorInfo) {
+	key := info.Key()
+	for _, existing := range f.Errors {
+		if existing.Key() == key {
+			return
+		}
+	}
+	f.Errors = append(f.Errors, info)
+}
+
+// AddErrors adds multiple errors to the fact.
+func (f *InterfaceMethodFact) AddErrors(infos []ErrorInfo) {
+	for _, info := range infos {
+		f.AddError(info)
 	}
 }

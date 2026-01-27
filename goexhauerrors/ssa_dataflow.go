@@ -16,10 +16,11 @@ type ssaAnalyzer struct {
 	localErrs           *localErrors
 	localFacts          map[*types.Func]*FunctionErrorsFact
 	localParamFlowFacts map[*types.Func]*ParameterFlowFact
+	interfaceImpls      *interfaceImplementations
 }
 
 // newSSAAnalyzer creates a new SSA analyzer.
-func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact) *ssaAnalyzer {
+func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, interfaceImpls *interfaceImplementations) *ssaAnalyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	return &ssaAnalyzer{
 		pass:                pass,
@@ -27,6 +28,7 @@ func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[
 		localErrs:           localErrs,
 		localFacts:          localFacts,
 		localParamFlowFacts: localParamFlowFacts,
+		interfaceImpls:      interfaceImpls,
 	}
 }
 
@@ -167,6 +169,11 @@ func filterStdlibErrors(errs []ErrorInfo) []ErrorInfo {
 // getErrorsFromCall extracts error information from a function call.
 // Only returns errors if the called function has FunctionErrorsFact.
 func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
+	// Check for interface method call (invoke mode)
+	if call.Call.IsInvoke() {
+		return a.getErrorsFromInvoke(call)
+	}
+
 	var errs []ErrorInfo
 
 	callee := call.Call.StaticCallee()
@@ -196,6 +203,50 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
 	}
 
 	return errs
+}
+
+// getErrorsFromInvoke extracts error information from an interface method call.
+// It collects errors from all known implementations of the interface method.
+func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
+	ifaceMethod := call.Call.Method
+	if ifaceMethod == nil {
+		return nil
+	}
+
+	// First check if there's an InterfaceMethodFact for this method
+	var ifaceFact InterfaceMethodFact
+	if a.pass.ImportObjectFact(ifaceMethod, &ifaceFact) {
+		return ifaceFact.Errors
+	}
+
+	// Get the interface type from the receiver
+	ifaceType := getInterfaceType(call.Call.Value.Type())
+	if ifaceType == nil {
+		return nil
+	}
+
+	// Find all implementations and collect their errors
+	var allErrors []ErrorInfo
+	implementingTypes := a.interfaceImpls.getImplementingTypes(ifaceType)
+	for _, concreteType := range implementingTypes {
+		method := findMethodImplementation(concreteType, ifaceMethod)
+		if method == nil {
+			continue
+		}
+
+		// Get errors from this method's FunctionErrorsFact (local facts first)
+		if localFact, ok := a.localFacts[method]; ok {
+			allErrors = append(allErrors, localFact.Errors...)
+		}
+
+		// Also check imported facts
+		var fnFact FunctionErrorsFact
+		if a.pass.ImportObjectFact(method, &fnFact) {
+			allErrors = append(allErrors, fnFact.Errors...)
+		}
+	}
+
+	return a.deduplicateErrors(allErrors)
 }
 
 // isStandardLibraryPackage checks if a package path is a standard library package
