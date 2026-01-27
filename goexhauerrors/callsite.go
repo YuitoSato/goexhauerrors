@@ -293,8 +293,14 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 }
 
 // reportUncheckedErrors reports any errors that haven't been checked.
+// Only reports errors from the current module (excludes external packages).
 func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
+	modulePath := getModulePath(pass)
 	for _, errInfo := range state.errors {
+		// Skip external package errors
+		if !isModulePackage(modulePath, errInfo.PkgPath) {
+			continue
+		}
 		key := errInfo.Key()
 		if !state.checked[key] {
 			pass.Reportf(state.callPos, "missing errors.Is check for %s", key)

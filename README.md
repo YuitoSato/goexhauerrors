@@ -339,15 +339,26 @@ func caller() {
 }
 ```
 
-### External Packages (stdlib)
+### External Packages
+
+Errors from external packages (standard library and third-party packages) are not tracked. This linter focuses on exhaustive checking of errors defined in your own codebase:
 
 ```go
-import "database/sql"
+import (
+    "database/sql"
+    "gorm.io/gorm"
+)
 
 func Query() error {
-    return sql.ErrNoRows  // No fact exported from stdlib
+    return sql.ErrNoRows  // Not tracked (stdlib)
+}
+
+func FindUser() error {
+    return gorm.ErrRecordNotFound  // Not tracked (external package)
 }
 ```
+
+External errors should be converted to your domain errors at API boundaries.
 
 ### Dynamic Error Creation
 
@@ -377,7 +388,7 @@ func CreateError(msg string) error {
 | | Higher-order functions (lambda) | Yes |
 | Not Supported | Unexported errors | No (by design) |
 | | Struct/map field storage | No |
-| | External packages (stdlib) | No |
+| | External packages | No (by design) |
 | | Dynamic error creation | No |
 
 ## Usage
