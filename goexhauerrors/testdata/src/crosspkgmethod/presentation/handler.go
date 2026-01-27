@@ -24,12 +24,10 @@ func NewHandler(uc *usecase.UpdateUseCase) *Handler {
 }
 
 // Update handles the update request.
-// This should warn because ErrTableNotFound is not checked with errors.Is.
+// ErrTableNotFound is propagated via fmt.Errorf, so no warning is issued.
 func (h *Handler) Update(ctx context.Context, tableID string) error { // want Update:`\[crosspkgmethod/presentation.ErrNotFound, crosspkgmethod/presentation.ErrInternal\]`
-	err := h.updateUC.Execute(ctx, tableID) // want "missing errors.Is check for crosspkgmethod/errors.ErrTableNotFound"
+	err := h.updateUC.Execute(ctx, tableID)
 	if err != nil {
-		// BUG: usecase.ErrTableNotFound is not checked!
-		// goexhauerrors should detect this
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return fmt.Errorf("%w: %v", ErrNotFound, err)

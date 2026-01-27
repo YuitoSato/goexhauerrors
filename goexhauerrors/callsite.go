@@ -183,14 +183,12 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 		}
 
 	case *ast.ReturnStmt:
-		// Check if error variables are propagated directly (not wrapped)
+		// Check if error variables are propagated
 		for varObj, state := range states {
 			for _, result := range s.Results {
-				// Only mark as propagated if the error is returned directly (return err)
-				// Not if it's wrapped in fmt.Errorf or similar
-				if isDirectVariableReturn(pass, result, varObj) {
+				if referencesVariable(pass, result, varObj) {
 					if canPropagate {
-						// Mark all errors as "checked" since we're propagating directly
+						// Mark all errors as "checked" since we're propagating
 						for _, errInfo := range state.errors {
 							state.checked[errInfo.Key()] = true
 						}
@@ -842,17 +840,6 @@ func referencesVariable(pass *analysis.Pass, expr ast.Expr, targetVar *types.Var
 		return true
 	})
 	return found
-}
-
-// isDirectVariableReturn checks if the expression is a direct return of the variable.
-// Returns true for "return err" but false for "return fmt.Errorf(..., err)"
-func isDirectVariableReturn(pass *analysis.Pass, expr ast.Expr, targetVar *types.Var) bool {
-	// Check if it's a direct identifier reference
-	if ident, ok := expr.(*ast.Ident); ok {
-		obj := pass.TypesInfo.Uses[ident]
-		return obj == targetVar
-	}
-	return false
 }
 
 // extractErrorKey extracts the error key from an errors.Is second argument.
