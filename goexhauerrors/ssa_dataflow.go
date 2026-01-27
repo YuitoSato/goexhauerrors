@@ -152,16 +152,14 @@ func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bo
 	}
 
 	// Filter out any external package types (including stdlib)
-	return a.filterExternalErrors(errs)
+	return a.filterIgnoredPackages(errs)
 }
 
-// filterExternalErrors removes errors from external packages (including stdlib).
-// Only keeps errors that belong to the current module.
-func (a *ssaAnalyzer) filterExternalErrors(errs []ErrorInfo) []ErrorInfo {
-	modulePath := getModulePath(a.pass)
+// filterIgnoredPackages removes errors from ignored packages.
+func (a *ssaAnalyzer) filterIgnoredPackages(errs []ErrorInfo) []ErrorInfo {
 	var filtered []ErrorInfo
 	for _, s := range errs {
-		if isModulePackage(modulePath, s.PkgPath) {
+		if !shouldIgnorePackage(s.PkgPath) {
 			filtered = append(filtered, s)
 		}
 	}
@@ -276,8 +274,8 @@ func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorIn
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibrary(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
@@ -333,8 +331,8 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibrary(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
@@ -383,8 +381,8 @@ func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
 		return nil
 	}
 
-	// Skip standard library packages entirely
-	if isStandardLibrary(pkg.Path()) {
+	// Skip ignored packages
+	if shouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 

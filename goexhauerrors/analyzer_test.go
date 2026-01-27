@@ -33,3 +33,23 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgmethod/presentation",
 	)
 }
+
+func TestAnalyzerWithIgnorePackages(t *testing.T) {
+	testdata := analysistest.TestData()
+
+	// Set the ignorePackages flag
+	if err := goexhauerrors.Analyzer.Flags.Set("ignorePackages", "ignored"); err != nil {
+		t.Fatalf("failed to set ignorePackages flag: %v", err)
+	}
+
+	// Reset flag after test
+	defer func() {
+		_ = goexhauerrors.Analyzer.Flags.Set("ignorePackages", "")
+	}()
+
+	// Run tests - errors from "ignored" package should be skipped in useignored
+	analysistest.Run(t, testdata, goexhauerrors.Analyzer,
+		"ignored",
+		"useignored",
+	)
+}
