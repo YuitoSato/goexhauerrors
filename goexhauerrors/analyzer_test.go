@@ -28,5 +28,8 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkg/errors",
 		"crosspkg/middle",
 		"crosspkg/caller",
+		"crosspkgmethod/errors",
+		"crosspkgmethod/usecase",
+		"crosspkgmethod/presentation",
 	)
 }
