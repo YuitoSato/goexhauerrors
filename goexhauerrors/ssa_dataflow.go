@@ -549,6 +549,157 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 	return fact
 }
 
+// detectFunctionParamCallFlow analyzes a function to determine which function-typed
+// parameters are called and their results flow to the error return.
+// Example: func RunInTx(fn func() error) error { return fn() }
+func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions []int) *FunctionParamCallFlowFact {
+	ssaFn := a.findSSAFunction(fn)
+	if ssaFn == nil {
+		return nil
+	}
+
+	// For methods, SSA includes receiver at index 0, but call.Args doesn't
+	// We need to adjust the parameter index
+	sig := fn.Type().(*types.Signature)
+	receiverOffset := 0
+	if sig.Recv() != nil {
+		receiverOffset = 1
+	}
+
+	fact := &FunctionParamCallFlowFact{}
+
+	// For each return statement, trace if the return value comes from calling a function parameter
+	for _, block := range ssaFn.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
+			if !ok {
+				continue
+			}
+
+			for _, pos := range errorPositions {
+				if pos < len(ret.Results) {
+					flows := a.traceValueToFunctionParamCalls(ret.Results[pos], ssaFn.Params, make(map[ssa.Value]bool), 0)
+					for _, flow := range flows {
+						// Adjust parameter index for methods (receiver is not in call.Args)
+						adjustedFlow := FunctionParamCallFlowInfo{
+							ParamIndex: flow.ParamIndex - receiverOffset,
+							Wrapped:    flow.Wrapped,
+						}
+						fact.AddCallFlow(adjustedFlow)
+					}
+				}
+			}
+		}
+	}
+
+	if len(fact.CallFlows) == 0 {
+		return nil
+	}
+	return fact
+}
+
+// traceValueToFunctionParamCalls traces an SSA value to find if it comes from
+// calling a function-typed parameter.
+func (a *ssaAnalyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []FunctionParamCallFlowInfo {
+	if val == nil || visited[val] || depth > maxTraceDepth {
+		return nil
+	}
+	visited[val] = true
+
+	var flows []FunctionParamCallFlowInfo
+
+	switch v := val.(type) {
+	case *ssa.Call:
+		// Check if the callee is a parameter (dynamic call to function parameter)
+		if param, ok := v.Call.Value.(*ssa.Parameter); ok {
+			// Find the parameter index
+			for i, p := range params {
+				if p == param {
+					flows = append(flows, FunctionParamCallFlowInfo{
+						ParamIndex: i,
+						Wrapped:    false,
+					})
+				}
+			}
+		}
+
+		// Also check for fmt.Errorf wrapping the result of a function parameter call
+		callee := v.Call.StaticCallee()
+		if callee != nil && isFmtErrorfSSA(callee) {
+			wrappedFlows := a.analyzeErrorfWrappingForFunctionParamCalls(v, params, visited, depth)
+			flows = append(flows, wrappedFlows...)
+		}
+
+	case *ssa.Phi:
+		// Merge of values from different branches
+		for _, edge := range v.Edges {
+			flows = append(flows, a.traceValueToFunctionParamCalls(edge, params, visited, depth+1)...)
+		}
+
+	case *ssa.ChangeInterface:
+		flows = append(flows, a.traceValueToFunctionParamCalls(v.X, params, visited, depth+1)...)
+
+	case *ssa.MakeInterface:
+		flows = append(flows, a.traceValueToFunctionParamCalls(v.X, params, visited, depth+1)...)
+
+	case *ssa.Extract:
+		flows = append(flows, a.traceValueToFunctionParamCalls(v.Tuple, params, visited, depth+1)...)
+	}
+
+	return deduplicateFunctionParamCallFlows(flows)
+}
+
+// analyzeErrorfWrappingForFunctionParamCalls checks if fmt.Errorf wraps the result of a function parameter call
+func (a *ssaAnalyzer) analyzeErrorfWrappingForFunctionParamCalls(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []FunctionParamCallFlowInfo {
+	args := call.Call.Args
+	if len(args) < 1 {
+		return nil
+	}
+
+	formatStr := extractConstantString(args[0])
+	if formatStr == "" {
+		return nil
+	}
+
+	wrapIndices := findWrapVerbIndices(formatStr)
+
+	var flows []FunctionParamCallFlowInfo
+
+	variadicArgs := args[1:]
+	if len(args) == 2 {
+		if slice, ok := args[1].(*ssa.Slice); ok {
+			variadicArgs = extractSliceElements(slice)
+		}
+	}
+
+	for _, wrapIdx := range wrapIndices {
+		if wrapIdx >= len(variadicArgs) {
+			continue
+		}
+
+		paramCallFlows := a.traceValueToFunctionParamCalls(variadicArgs[wrapIdx], params, visited, depth+1)
+		for i := range paramCallFlows {
+			paramCallFlows[i].Wrapped = true
+		}
+		flows = append(flows, paramCallFlows...)
+	}
+
+	return flows
+}
+
+// deduplicateFunctionParamCallFlows removes duplicate function parameter call flows.
+func deduplicateFunctionParamCallFlows(flows []FunctionParamCallFlowInfo) []FunctionParamCallFlowInfo {
+	seen := make(map[int]bool)
+	var result []FunctionParamCallFlowInfo
+	for _, flow := range flows {
+		if !seen[flow.ParamIndex] {
+			seen[flow.ParamIndex] = true
+			result = append(result, flow)
+		}
+	}
+	return result
+}
+
 // traceValueToParameters traces an SSA value back to see if it originates from parameters.
 // Returns a list of ParameterFlowInfo for any parameters that flow to this value.
 func (a *ssaAnalyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {

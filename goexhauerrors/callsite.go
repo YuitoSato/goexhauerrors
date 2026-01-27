@@ -371,6 +371,15 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 			}
 		}
 
+		// Also resolve errors through FunctionParamCallFlowFact (for higher-order functions)
+		var callFlowFact FunctionParamCallFlowFact
+		if pass.ImportObjectFact(calledFn, &callFlowFact) {
+			callFlowErrors := resolveFunctionParamCallFlowErrors(pass, call, &callFlowFact)
+			for _, err := range callFlowErrors {
+				result.AddError(err)
+			}
+		}
+
 		if len(result.Errors) > 0 {
 			return result, sig
 		}
@@ -522,6 +531,11 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
 					Wrapped: false,
 				})
 			}
+			// Also check for FunctionErrorsFact (for closure variables)
+			var fnFact FunctionErrorsFact
+			if pass.ImportObjectFact(varObj, &fnFact) {
+				errs = append(errs, fnFact.Errors...)
+			}
 		}
 
 	case *ast.SelectorExpr:
@@ -562,6 +576,10 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
 
 	case *ast.CompositeLit:
 		errs = append(errs, extractErrorsFromCompositeLit(pass, e)...)
+
+	case *ast.FuncLit:
+		// Analyze lambda body directly to extract errors
+		errs = append(errs, analyzeFuncLitErrors(pass, e)...)
 	}
 
 	return errs
@@ -600,6 +618,66 @@ func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLi
 			Name:    typeName.Name(),
 			Wrapped: false,
 		})
+	}
+
+	return errs
+}
+
+// analyzeFuncLitErrors analyzes a function literal (lambda) body to extract errors.
+func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []ErrorInfo {
+	tv := pass.TypesInfo.Types[funcLit]
+	if !tv.IsValue() {
+		return nil
+	}
+
+	sig, ok := tv.Type.(*types.Signature)
+	if !ok {
+		return nil
+	}
+
+	errorPositions := findErrorReturnPositions(sig)
+	if len(errorPositions) == 0 {
+		return nil
+	}
+
+	var errs []ErrorInfo
+	ast.Inspect(funcLit.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+
+		for _, pos := range errorPositions {
+			if pos < len(ret.Results) {
+				errs = append(errs, extractErrorsFromExpr(pass, ret.Results[pos])...)
+			}
+		}
+		return true
+	})
+
+	return errs
+}
+
+// resolveFunctionParamCallFlowErrors resolves errors from function parameters that are called.
+// This handles higher-order functions like RunInTx(fn func() error) error { return fn() }
+func resolveFunctionParamCallFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flowFact *FunctionParamCallFlowFact) []ErrorInfo {
+	var errs []ErrorInfo
+
+	for _, flow := range flowFact.CallFlows {
+		if flow.ParamIndex >= len(call.Args) {
+			continue
+		}
+
+		arg := call.Args[flow.ParamIndex]
+		// extractErrorsFromExpr now handles *ast.FuncLit
+		argErrors := extractErrorsFromExpr(pass, arg)
+
+		for _, err := range argErrors {
+			if flow.Wrapped {
+				err.Wrapped = true
+			}
+			errs = append(errs, err)
+		}
 	}
 
 	return errs

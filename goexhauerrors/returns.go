@@ -65,6 +65,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 	// Track facts for local functions during iteration
 	localFacts := make(map[*types.Func]*FunctionErrorsFact)
 	localParamFlowFacts := make(map[*types.Func]*ParameterFlowFact)
+	localCallFlowFacts := make(map[*types.Func]*FunctionParamCallFlowFact)
 
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
 	for {
@@ -74,7 +75,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
 
 		for _, fi := range funcs {
-			// Phase A: Detect parameter flow
+			// Phase A: Detect parameter flow (for error-typed parameters)
 			paramFlowFact := ssaAnalyzer.detectParameterFlow(fi.fn, fi.errorPositions)
 			if paramFlowFact != nil {
 				existingParamFlow := localParamFlowFacts[fi.fn]
@@ -85,6 +86,22 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 					oldLen := len(existingParamFlow.Flows)
 					existingParamFlow.Merge(paramFlowFact)
 					if len(existingParamFlow.Flows) > oldLen {
+						changed = true
+					}
+				}
+			}
+
+			// Phase A2: Detect function parameter call flow (for function-typed parameters)
+			callFlowFact := ssaAnalyzer.detectFunctionParamCallFlow(fi.fn, fi.errorPositions)
+			if callFlowFact != nil {
+				existingCallFlow := localCallFlowFacts[fi.fn]
+				if existingCallFlow == nil {
+					localCallFlowFacts[fi.fn] = callFlowFact
+					changed = true
+				} else {
+					oldLen := len(existingCallFlow.CallFlows)
+					existingCallFlow.Merge(callFlowFact)
+					if len(existingCallFlow.CallFlows) > oldLen {
 						changed = true
 					}
 				}
@@ -137,6 +154,13 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 	// Export ParameterFlowFact for cross-package usage
 	for fn, fact := range localParamFlowFacts {
 		if len(fact.Flows) > 0 {
+			pass.ExportObjectFact(fn, fact)
+		}
+	}
+
+	// Export FunctionParamCallFlowFact for cross-package usage
+	for fn, fact := range localCallFlowFacts {
+		if len(fact.CallFlows) > 0 {
 			pass.ExportObjectFact(fn, fact)
 		}
 	}

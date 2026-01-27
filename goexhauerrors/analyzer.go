@@ -21,6 +21,7 @@ var Analyzer = &analysis.Analyzer{
 		(*FunctionErrorsFact)(nil),
 		(*ParameterFlowFact)(nil),
 		(*InterfaceMethodFact)(nil),
+		(*FunctionParamCallFlowFact)(nil),
 	},
 }
 

@@ -7,6 +7,7 @@ func init() {
 	gob.Register(&FunctionErrorsFact{})
 	gob.Register(&ParameterFlowFact{})
 	gob.Register(&InterfaceMethodFact{})
+	gob.Register(&FunctionParamCallFlowFact{})
 }
 
 // ErrorFact marks a variable or type as an error.
@@ -183,5 +184,63 @@ func (f *InterfaceMethodFact) AddError(info ErrorInfo) {
 func (f *InterfaceMethodFact) AddErrors(infos []ErrorInfo) {
 	for _, info := range infos {
 		f.AddError(info)
+	}
+}
+
+// FunctionParamCallFlowInfo describes how a function parameter's call result
+// flows to the return value.
+type FunctionParamCallFlowInfo struct {
+	ParamIndex int  // Index of the function-typed parameter (0-based)
+	Wrapped    bool // Whether the result is wrapped (e.g., via fmt.Errorf %w)
+}
+
+// FunctionParamCallFlowFact tracks parameters that are functions whose
+// call results flow to the return value.
+// Example: func RunInTx(fn func() error) error { return fn() }
+// -> FunctionParamCallFlowFact{CallFlows: [{ParamIndex: 0}]}
+// Attached to *types.Func objects.
+type FunctionParamCallFlowFact struct {
+	CallFlows []FunctionParamCallFlowInfo
+}
+
+func (*FunctionParamCallFlowFact) AFact() {}
+
+func (f *FunctionParamCallFlowFact) String() string {
+	if len(f.CallFlows) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, flow := range f.CallFlows {
+		if i > 0 {
+			result += ", "
+		}
+		if flow.Wrapped {
+			result += "wrapped:"
+		}
+		result += "call:"
+		result += string(rune('0' + flow.ParamIndex))
+	}
+	result += "]"
+	return result
+}
+
+// AddCallFlow adds a function parameter call flow to the fact if not already present.
+func (f *FunctionParamCallFlowFact) AddCallFlow(flow FunctionParamCallFlowInfo) {
+	for i, existing := range f.CallFlows {
+		if existing.ParamIndex == flow.ParamIndex {
+			// If already exists, upgrade to wrapped if needed
+			if flow.Wrapped && !existing.Wrapped {
+				f.CallFlows[i].Wrapped = true
+			}
+			return
+		}
+	}
+	f.CallFlows = append(f.CallFlows, flow)
+}
+
+// Merge merges another fact's flows into this one.
+func (f *FunctionParamCallFlowFact) Merge(other *FunctionParamCallFlowFact) {
+	for _, flow := range other.CallFlows {
+		f.AddCallFlow(flow)
 	}
 }
