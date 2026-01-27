@@ -64,6 +64,11 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 					continue
 				}
 
+				// Skip unexported errors
+				if !token.IsExported(name.Name) {
+					continue
+				}
+
 				// Check initialization pattern
 				if i < len(valueSpec.Values) {
 					if isSentinelInit(pass, valueSpec.Values[i]) {
@@ -90,6 +95,11 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 		obj := scope.Lookup(name)
 		typeName, ok := obj.(*types.TypeName)
 		if !ok {
+			continue
+		}
+
+		// Skip unexported types
+		if !token.IsExported(name) {
 			continue
 		}
 
