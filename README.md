@@ -240,6 +240,43 @@ func Test() {
 }
 ```
 
+### Interface Method Calls
+
+Errors from interface method implementations are tracked by analyzing all concrete implementations:
+
+```go
+type Repository interface {
+    Get(id string) error
+}
+
+type UserRepo struct{}
+
+func (r *UserRepo) Get(id string) error {
+    return ErrNotFound  // Tracked
+}
+
+func Use(repo Repository) {
+    err := repo.Get("123")  // Warning: missing errors.Is check for ErrNotFound
+}
+```
+
+### Higher-Order Functions (Lambda)
+
+Errors from lambda functions passed to higher-order functions are detected:
+
+```go
+func RunInTx(fn func() error) error {
+    return fn()
+}
+
+func Caller() {
+    err := RunInTx(func() error {
+        return ErrNotFound  // Tracked through higher-order function
+    })
+    // Warning: missing errors.Is check for ErrNotFound
+}
+```
+
 ### No Check Required (Propagation)
 
 When propagating errors to the caller, no check is required:
@@ -271,23 +308,13 @@ func ReassignExample() {
 
 The following patterns are NOT detected:
 
-### Interface Method Calls
+### Unexported Errors
+
+Unexported errors (lowercase names) are intentionally excluded:
 
 ```go
-type Reader interface {
-    Read() error
-}
-
-func Use(r Reader) {
-    err := r.Read()  // Implementation unknown at compile time
-}
-```
-
-Note: Concrete type method calls ARE detected:
-
-```go
-var m MyReader
-err := m.Read()  // This IS detected
+var errInternal = errors.New("internal")  // Not tracked (unexported)
+var ErrPublic = errors.New("public")      // Tracked (exported)
 ```
 
 ### Struct/Map Field Storage
@@ -337,7 +364,9 @@ func CreateError(msg string) error {
 | | Variable reassignment | Yes |
 | | Concrete type methods | Yes |
 | | Function parameters | Yes |
-| Not Supported | Interface method calls | No |
+| | Interface method calls | Yes |
+| | Higher-order functions (lambda) | Yes |
+| Not Supported | Unexported errors | No (by design) |
 | | Struct/map field storage | No |
 | | External packages (stdlib) | No |
 | | Dynamic error creation | No |
