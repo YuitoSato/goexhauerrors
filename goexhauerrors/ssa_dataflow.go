@@ -11,20 +11,22 @@ import (
 
 // ssaAnalyzer provides SSA-based dataflow analysis for tracking error values.
 type ssaAnalyzer struct {
-	pass       *analysis.Pass
-	ssaResult  *buildssa.SSA
-	localErrs  *localErrors
-	localFacts map[*types.Func]*FunctionErrorsFact
+	pass                *analysis.Pass
+	ssaResult           *buildssa.SSA
+	localErrs           *localErrors
+	localFacts          map[*types.Func]*FunctionErrorsFact
+	localParamFlowFacts map[*types.Func]*ParameterFlowFact
 }
 
 // newSSAAnalyzer creates a new SSA analyzer.
-func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact) *ssaAnalyzer {
+func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact) *ssaAnalyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	return &ssaAnalyzer{
-		pass:       pass,
-		ssaResult:  ssaResult,
-		localErrs:  localErrs,
-		localFacts: localFacts,
+		pass:                pass,
+		ssaResult:           ssaResult,
+		localErrs:           localErrs,
+		localFacts:          localFacts,
+		localParamFlowFacts: localParamFlowFacts,
 	}
 }
 
@@ -94,6 +96,10 @@ func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bo
 		// Function call result - get errors from the called function's facts only
 		callErrs := a.getErrorsFromCall(v)
 		errs = append(errs, callErrs...)
+
+		// Also resolve errors via ParameterFlowFact
+		paramFlowErrs := a.resolveParameterFlowErrors(v, visited, depth)
+		errs = append(errs, paramFlowErrs...)
 		// Do NOT trace further into the call - this avoids picking up internal types
 
 	case *ssa.Extract:
@@ -378,6 +384,365 @@ func (a *ssaAnalyzer) deduplicateErrors(errs []ErrorInfo) []ErrorInfo {
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// resolveParameterFlowErrors resolves concrete errors passed to functions with ParameterFlowFact.
+func (a *ssaAnalyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return nil
+	}
+
+	fn := callee.Object()
+	if fn == nil {
+		return nil
+	}
+
+	typesFunc, ok := fn.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Check for ParameterFlowFact
+	var flowFact *ParameterFlowFact
+	hasFlowFact := false
+
+	// Check local facts first
+	if localFlowFact, ok := a.localParamFlowFacts[typesFunc]; ok {
+		flowFact = localFlowFact
+		hasFlowFact = true
+	}
+
+	// Also check imported facts
+	var importedFlowFact ParameterFlowFact
+	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
+		if flowFact == nil {
+			flowFact = &importedFlowFact
+		} else {
+			flowFact.Merge(&importedFlowFact)
+		}
+		hasFlowFact = true
+	}
+
+	if !hasFlowFact || flowFact == nil || len(flowFact.Flows) == 0 {
+		return nil
+	}
+
+	var errs []ErrorInfo
+	args := call.Call.Args
+
+	for _, flow := range flowFact.Flows {
+		argIdx := flow.ParamIndex
+		if argIdx >= len(args) {
+			continue
+		}
+
+		// Recursively trace the argument to find concrete errors
+		argErrs := a.traceValueToErrors(args[argIdx], visited, depth+1)
+
+		// Apply wrapped flag if the parameter flow is wrapped
+		for i := range argErrs {
+			if flow.Wrapped {
+				argErrs[i].Wrapped = true
+			}
+		}
+
+		errs = append(errs, argErrs...)
+	}
+
+	return errs
+}
+
+// detectParameterFlow analyzes a function to determine which error parameters
+// flow to return values.
+func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) *ParameterFlowFact {
+	ssaFn := a.findSSAFunction(fn)
+	if ssaFn == nil {
+		return nil
+	}
+
+	// Find error parameters
+	sig := fn.Type().(*types.Signature)
+	errorParamIndices := findErrorParamIndices(sig)
+	if len(errorParamIndices) == 0 {
+		return nil
+	}
+
+	fact := &ParameterFlowFact{}
+
+	// For each return statement, trace which parameters reach it
+	for _, block := range ssaFn.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
+			if !ok {
+				continue
+			}
+
+			for _, pos := range errorPositions {
+				if pos < len(ret.Results) {
+					flows := a.traceValueToParameters(ret.Results[pos], ssaFn.Params, make(map[ssa.Value]bool), 0)
+					for _, flow := range flows {
+						fact.AddFlow(flow)
+					}
+				}
+			}
+		}
+	}
+
+	if len(fact.Flows) == 0 {
+		return nil
+	}
+	return fact
+}
+
+// traceValueToParameters traces an SSA value back to see if it originates from parameters.
+// Returns a list of ParameterFlowInfo for any parameters that flow to this value.
+func (a *ssaAnalyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+	if val == nil || visited[val] || depth > maxTraceDepth {
+		return nil
+	}
+	visited[val] = true
+
+	var flows []ParameterFlowInfo
+
+	switch v := val.(type) {
+	case *ssa.Parameter:
+		// Found a parameter - check if it's an error type
+		for i, param := range params {
+			if param == v && isErrorType(param.Type()) {
+				flows = append(flows, ParameterFlowInfo{
+					ParamIndex: i,
+					Wrapped:    false,
+				})
+			}
+		}
+
+	case *ssa.Phi:
+		// Merge of values from different branches
+		for _, edge := range v.Edges {
+			flows = append(flows, a.traceValueToParameters(edge, params, visited, depth+1)...)
+		}
+
+	case *ssa.Call:
+		// Check if this is fmt.Errorf with %w wrapping a parameter
+		callee := v.Call.StaticCallee()
+		if callee != nil {
+			if isFmtErrorfSSA(callee) {
+				wrappedFlows := a.analyzeErrorfWrapping(v, params, visited, depth)
+				flows = append(flows, wrappedFlows...)
+			} else {
+				// Check if the called function has ParameterFlowFact
+				// and resolve transitively (wrapper calling another wrapper)
+				transitiveFlows := a.traceTransitiveParameterFlow(v, params, visited, depth)
+				flows = append(flows, transitiveFlows...)
+			}
+		}
+
+	case *ssa.ChangeInterface:
+		flows = append(flows, a.traceValueToParameters(v.X, params, visited, depth+1)...)
+
+	case *ssa.MakeInterface:
+		flows = append(flows, a.traceValueToParameters(v.X, params, visited, depth+1)...)
+
+	case *ssa.Extract:
+		flows = append(flows, a.traceValueToParameters(v.Tuple, params, visited, depth+1)...)
+	}
+
+	return deduplicateFlows(flows)
+}
+
+// traceTransitiveParameterFlow handles wrappers that call other wrappers.
+func (a *ssaAnalyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return nil
+	}
+
+	fn := callee.Object()
+	if fn == nil {
+		return nil
+	}
+
+	typesFunc, ok := fn.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Get ParameterFlowFact for the called function
+	var flowFact *ParameterFlowFact
+	if localFlowFact, ok := a.localParamFlowFacts[typesFunc]; ok {
+		flowFact = localFlowFact
+	}
+	var importedFlowFact ParameterFlowFact
+	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
+		if flowFact == nil {
+			flowFact = &importedFlowFact
+		}
+	}
+
+	if flowFact == nil || len(flowFact.Flows) == 0 {
+		return nil
+	}
+
+	var flows []ParameterFlowInfo
+	args := call.Call.Args
+
+	for _, flow := range flowFact.Flows {
+		argIdx := flow.ParamIndex
+		if argIdx >= len(args) {
+			continue
+		}
+
+		// Trace the argument to see if it's a parameter
+		argFlows := a.traceValueToParameters(args[argIdx], params, visited, depth+1)
+		for i := range argFlows {
+			if flow.Wrapped {
+				argFlows[i].Wrapped = true
+			}
+		}
+		flows = append(flows, argFlows...)
+	}
+
+	return flows
+}
+
+// isFmtErrorfSSA checks if the callee is fmt.Errorf
+func isFmtErrorfSSA(callee *ssa.Function) bool {
+	if callee.Pkg == nil {
+		return false
+	}
+	return callee.Pkg.Pkg.Path() == "fmt" && callee.Name() == "Errorf"
+}
+
+// analyzeErrorfWrapping analyzes fmt.Errorf calls for %w verbs that wrap parameters
+func (a *ssaAnalyzer) analyzeErrorfWrapping(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+	args := call.Call.Args
+	if len(args) < 1 {
+		return nil
+	}
+
+	// Get format string (first argument)
+	formatStr := extractConstantString(args[0])
+	if formatStr == "" {
+		return nil
+	}
+
+	wrapIndices := findWrapVerbIndices(formatStr)
+
+	var flows []ParameterFlowInfo
+
+	// Handle variadic arguments - they may be passed as a slice
+	// If there are only 2 args and arg[1] is a Slice, unpack it
+	variadicArgs := args[1:]
+	if len(args) == 2 {
+		// Check if the second argument is a slice that was constructed for variadic call
+		if slice, ok := args[1].(*ssa.Slice); ok {
+			// The slice is created from an array allocation
+			variadicArgs = extractSliceElements(slice)
+		}
+	}
+
+	for _, wrapIdx := range wrapIndices {
+		if wrapIdx >= len(variadicArgs) {
+			continue
+		}
+
+		// Trace this argument to see if it's a parameter
+		paramFlows := a.traceValueToParameters(variadicArgs[wrapIdx], params, visited, depth+1)
+		for i := range paramFlows {
+			paramFlows[i].Wrapped = true // Mark as wrapped
+		}
+		flows = append(flows, paramFlows...)
+	}
+
+	return flows
+}
+
+// extractSliceElements extracts elements from a slice used for variadic arguments.
+func extractSliceElements(slice *ssa.Slice) []ssa.Value {
+	var elements []ssa.Value
+
+	// The slice is typically created from an array: slice t0[:]
+	// where t0 is an Alloc for the array
+	alloc, ok := slice.X.(*ssa.Alloc)
+	if !ok {
+		return nil
+	}
+
+	// Collect elements stored in the array by finding IndexAddr + Store patterns
+	type indexedValue struct {
+		index int64
+		value ssa.Value
+	}
+	var indexed []indexedValue
+
+	for _, ref := range *alloc.Referrers() {
+		if idxAddr, ok := ref.(*ssa.IndexAddr); ok {
+			// Get the constant index
+			if constIdx, ok := idxAddr.Index.(*ssa.Const); ok {
+				idx := constIdx.Int64()
+				// Find the Store instruction that writes to this index
+				for _, storeRef := range *idxAddr.Referrers() {
+					if store, ok := storeRef.(*ssa.Store); ok {
+						indexed = append(indexed, indexedValue{index: idx, value: store.Val})
+					}
+				}
+			}
+		}
+	}
+
+	// Sort by index and extract values
+	// For simplicity, just add them in order found (usually correct for small arrays)
+	for _, iv := range indexed {
+		// Expand to the correct position if needed
+		for len(elements) <= int(iv.index) {
+			elements = append(elements, nil)
+		}
+		elements[iv.index] = iv.value
+	}
+
+	return elements
+}
+
+// extractConstantString extracts a constant string value from an SSA value.
+func extractConstantString(val ssa.Value) string {
+	if c, ok := val.(*ssa.Const); ok {
+		if c.Value != nil {
+			// Kind is "String" (capital S)
+			if c.Value.Kind().String() == "String" {
+				s := c.Value.ExactString()
+				if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+					return s[1 : len(s)-1]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findErrorParamIndices finds which parameter indices are error types
+func findErrorParamIndices(sig *types.Signature) []int {
+	var indices []int
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		if isErrorType(params.At(i).Type()) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// deduplicateFlows removes duplicate parameter flows.
+func deduplicateFlows(flows []ParameterFlowInfo) []ParameterFlowInfo {
+	seen := make(map[int]bool)
+	var result []ParameterFlowInfo
+	for _, flow := range flows {
+		if !seen[flow.ParamIndex] {
+			seen[flow.ParamIndex] = true
+			result = append(result, flow)
 		}
 	}
 	return result

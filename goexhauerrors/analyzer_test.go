@@ -22,6 +22,7 @@ func TestAnalyzer(t *testing.T) {
 		"limitations",
 		"nested",
 		"unexported",
+		"paramflow",
 		"crosspkg/errors",
 		"crosspkg/middle",
 		"crosspkg/caller",

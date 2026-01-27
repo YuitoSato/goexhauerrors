@@ -19,6 +19,7 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{
 		(*ErrorFact)(nil),
 		(*FunctionErrorsFact)(nil),
+		(*ParameterFlowFact)(nil),
 	},
 }
 

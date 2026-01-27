@@ -205,6 +205,41 @@ func CheckCustomType() {
 }
 ```
 
+### Function Parameter Tracking
+
+Errors passed through function parameters are tracked:
+
+```go
+func WrapError(err error) error {
+    return fmt.Errorf("wrapped: %w", err)
+}
+
+func Caller() {
+    err := WrapError(ErrNotFound)  // Warning: missing errors.Is check for ErrNotFound
+    if err != nil {
+        println(err.Error())
+    }
+}
+
+func CallerGood() {
+    err := WrapError(ErrNotFound)
+    if errors.Is(err, ErrNotFound) {
+        println("not found")  // OK
+    }
+}
+```
+
+Chained wrappers are also supported:
+
+```go
+func Wrapper1(err error) error { return Wrapper2(err) }
+func Wrapper2(err error) error { return err }
+
+func Test() {
+    err := Wrapper1(ErrNotFound)  // Warning: ErrNotFound flows through both wrappers
+}
+```
+
 ### No Check Required (Propagation)
 
 When propagating errors to the caller, no check is required:
@@ -235,14 +270,6 @@ func ReassignExample() {
 ## Limitations
 
 The following patterns are NOT detected:
-
-### Errors from Function Parameters
-
-```go
-func WrapError(err error) error {
-    return fmt.Errorf("wrapped: %w", err)  // Cannot track what err is
-}
-```
 
 ### Interface Method Calls
 
@@ -309,8 +336,8 @@ func CreateError(msg string) error {
 | | Closures | Yes |
 | | Variable reassignment | Yes |
 | | Concrete type methods | Yes |
-| Not Supported | Function parameters | No |
-| | Interface method calls | No |
+| | Function parameters | Yes |
+| Not Supported | Interface method calls | No |
 | | Struct/map field storage | No |
 | | External packages (stdlib) | No |
 | | Dynamic error creation | No |

@@ -340,13 +340,31 @@ func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[
 
 // getCallErrors returns the FunctionErrorsFact and signature for a call expression.
 // It handles both regular function calls and closure variable calls.
+// It also resolves errors through ParameterFlowFact.
 func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact, *types.Signature) {
 	// First, try to get it as a regular function
 	calledFn := getCalledFunction(pass, call)
 	if calledFn != nil {
+		sig := calledFn.Type().(*types.Signature)
+
+		// Start with FunctionErrorsFact
+		result := &FunctionErrorsFact{}
 		var fnFact FunctionErrorsFact
 		if pass.ImportObjectFact(calledFn, &fnFact) {
-			return &fnFact, calledFn.Type().(*types.Signature)
+			result.Merge(&fnFact)
+		}
+
+		// Also resolve errors through ParameterFlowFact
+		var flowFact ParameterFlowFact
+		if pass.ImportObjectFact(calledFn, &flowFact) {
+			paramFlowErrors := resolveParameterFlowErrorsAST(pass, call, &flowFact)
+			for _, err := range paramFlowErrors {
+				result.AddError(err)
+			}
+		}
+
+		if len(result.Errors) > 0 {
+			return result, sig
 		}
 		return nil, nil
 	}
@@ -375,6 +393,135 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 	}
 
 	return nil, nil
+}
+
+// resolveParameterFlowErrorsAST resolves errors from call arguments based on ParameterFlowFact.
+func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flowFact *ParameterFlowFact) []ErrorInfo {
+	var errs []ErrorInfo
+
+	for _, flow := range flowFact.Flows {
+		if flow.ParamIndex >= len(call.Args) {
+			continue
+		}
+
+		arg := call.Args[flow.ParamIndex]
+		argErrors := extractErrorsFromExpr(pass, arg)
+
+		for _, err := range argErrors {
+			if flow.Wrapped {
+				err.Wrapped = true
+			}
+			errs = append(errs, err)
+		}
+	}
+
+	return errs
+}
+
+// extractErrorsFromExpr extracts known errors from an expression.
+func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
+	var errs []ErrorInfo
+
+	switch e := expr.(type) {
+	case *ast.Ident:
+		obj := pass.TypesInfo.Uses[e]
+		if varObj, ok := obj.(*types.Var); ok {
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				errs = append(errs, ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
+					Wrapped: false,
+				})
+			} else if varObj.Pkg() != nil && isErrorType(varObj.Type()) {
+				// Local error variable
+				errs = append(errs, ErrorInfo{
+					PkgPath: varObj.Pkg().Path(),
+					Name:    varObj.Name(),
+					Wrapped: false,
+				})
+			}
+		}
+
+	case *ast.SelectorExpr:
+		obj := pass.TypesInfo.Uses[e.Sel]
+		if varObj, ok := obj.(*types.Var); ok {
+			var errorFact ErrorFact
+			if pass.ImportObjectFact(varObj, &errorFact) {
+				errs = append(errs, ErrorInfo{
+					PkgPath: errorFact.PkgPath,
+					Name:    errorFact.Name,
+					Wrapped: false,
+				})
+			}
+		}
+
+	case *ast.CallExpr:
+		// If the argument is a function call, recursively get its errors
+		calledFn := getCalledFunction(pass, e)
+		if calledFn != nil {
+			var fnFact FunctionErrorsFact
+			if pass.ImportObjectFact(calledFn, &fnFact) {
+				errs = append(errs, fnFact.Errors...)
+			}
+			// Also check ParameterFlowFact for chained wrappers
+			var flowFact ParameterFlowFact
+			if pass.ImportObjectFact(calledFn, &flowFact) {
+				paramErrs := resolveParameterFlowErrorsAST(pass, e, &flowFact)
+				errs = append(errs, paramErrs...)
+			}
+		}
+
+	case *ast.UnaryExpr:
+		if e.Op.String() == "&" {
+			if compLit, ok := e.X.(*ast.CompositeLit); ok {
+				errs = append(errs, extractErrorsFromCompositeLit(pass, compLit)...)
+			}
+		}
+
+	case *ast.CompositeLit:
+		errs = append(errs, extractErrorsFromCompositeLit(pass, e)...)
+	}
+
+	return errs
+}
+
+// extractErrorsFromCompositeLit extracts error type information from a composite literal.
+func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit) []ErrorInfo {
+	var errs []ErrorInfo
+
+	tv := pass.TypesInfo.Types[compLit]
+	if !tv.IsValue() {
+		return nil
+	}
+
+	namedType := extractNamedType(tv.Type)
+	if namedType == nil {
+		return nil
+	}
+
+	typeName := namedType.Obj()
+	if typeName == nil {
+		return nil
+	}
+
+	var errorFact ErrorFact
+	if pass.ImportObjectFact(typeName, &errorFact) {
+		errs = append(errs, ErrorInfo{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
+			Wrapped: false,
+		})
+	} else if typeName.Pkg() != nil {
+		// Local custom error type
+		errs = append(errs, ErrorInfo{
+			PkgPath: typeName.Pkg().Path(),
+			Name:    typeName.Name(),
+			Wrapped: false,
+		})
+	}
+
+	return errs
 }
 
 // findErrorVarInAssignmentWithSig finds the error variable in an assignment statement using a signature.

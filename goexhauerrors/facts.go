@@ -5,6 +5,7 @@ import "encoding/gob"
 func init() {
 	gob.Register(&ErrorFact{})
 	gob.Register(&FunctionErrorsFact{})
+	gob.Register(&ParameterFlowFact{})
 }
 
 // ErrorFact marks a variable or type as an error.
@@ -88,4 +89,57 @@ func (f *FunctionErrorsFact) FilterByValidErrors(validErrors map[string]bool) {
 		}
 	}
 	f.Errors = filtered
+}
+
+// ParameterFlowInfo describes how a function parameter flows to return values.
+type ParameterFlowInfo struct {
+	ParamIndex int  // Index of the parameter (0-based, excluding receiver for methods)
+	Wrapped    bool // Whether the parameter is wrapped (e.g., via fmt.Errorf %w)
+}
+
+// ParameterFlowFact stores information about parameters that flow to return values.
+// Attached to *types.Func objects for functions where error parameters are propagated.
+type ParameterFlowFact struct {
+	Flows []ParameterFlowInfo // Parameters that flow to error returns
+}
+
+func (*ParameterFlowFact) AFact() {}
+
+func (f *ParameterFlowFact) String() string {
+	if len(f.Flows) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, flow := range f.Flows {
+		if i > 0 {
+			result += ", "
+		}
+		if flow.Wrapped {
+			result += "wrapped:"
+		}
+		result += string(rune('0' + flow.ParamIndex))
+	}
+	result += "]"
+	return result
+}
+
+// AddFlow adds a parameter flow to the fact if not already present.
+func (f *ParameterFlowFact) AddFlow(flow ParameterFlowInfo) {
+	for _, existing := range f.Flows {
+		if existing.ParamIndex == flow.ParamIndex {
+			// If already exists, upgrade to wrapped if needed
+			if flow.Wrapped && !existing.Wrapped {
+				existing.Wrapped = true
+			}
+			return
+		}
+	}
+	f.Flows = append(f.Flows, flow)
+}
+
+// Merge merges another fact's flows into this one.
+func (f *ParameterFlowFact) Merge(other *ParameterFlowFact) {
+	for _, flow := range other.Flows {
+		f.AddFlow(flow)
+	}
 }

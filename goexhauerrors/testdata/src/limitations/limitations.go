@@ -5,16 +5,15 @@ import "errors"
 var ErrTest = errors.New("test error") // want ErrTest:`limitations.ErrTest`
 
 // =============================================================================
-// Test 1: Errors from Function Parameters - NOT detected (correct)
+// Test 1: Errors from Function Parameters - IS detected
 // =============================================================================
 
-func WrapError(err error) error {
+func WrapError(err error) error { // want WrapError:`\[0\]`
 	return err
 }
 
 func TestFunctionParameter() {
-	// Should NOT warn - parameter tracking not supported
-	err := WrapError(ErrTest)
+	err := WrapError(ErrTest) // want "missing errors.Is check for limitations.ErrTest"
 	if err != nil {
 		println(err.Error())
 	}

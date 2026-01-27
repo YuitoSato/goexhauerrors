@@ -61,15 +61,33 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 
 	// Track facts for local functions during iteration
 	localFacts := make(map[*types.Func]*FunctionErrorsFact)
+	localParamFlowFacts := make(map[*types.Func]*ParameterFlowFact)
 
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
 	for {
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts)
+		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts)
 
 		for _, fi := range funcs {
+			// Phase A: Detect parameter flow
+			paramFlowFact := ssaAnalyzer.detectParameterFlow(fi.fn, fi.errorPositions)
+			if paramFlowFact != nil {
+				existingParamFlow := localParamFlowFacts[fi.fn]
+				if existingParamFlow == nil {
+					localParamFlowFacts[fi.fn] = paramFlowFact
+					changed = true
+				} else {
+					oldLen := len(existingParamFlow.Flows)
+					existingParamFlow.Merge(paramFlowFact)
+					if len(existingParamFlow.Flows) > oldLen {
+						changed = true
+					}
+				}
+			}
+
+			// Phase B: Analyze errors (AST-based + SSA-based)
 			fact := &FunctionErrorsFact{}
 
 			// AST-based analysis
@@ -109,6 +127,13 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 	for fn, fact := range localFacts {
 		fact.FilterByValidErrors(validErrors)
 		if len(fact.Errors) > 0 {
+			pass.ExportObjectFact(fn, fact)
+		}
+	}
+
+	// Export ParameterFlowFact for cross-package usage
+	for fn, fact := range localParamFlowFacts {
+		if len(fact.Flows) > 0 {
 			pass.ExportObjectFact(fn, fact)
 		}
 	}
