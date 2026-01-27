@@ -485,20 +485,39 @@ func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*Func
 	return nil, nil
 }
 
-// resolveParameterFlowErrorsAST resolves errors from call arguments based on ParameterFlowFact.
-func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flowFact *ParameterFlowFact) []ErrorInfo {
+// flowInfo represents a parameter flow with index and wrapped flag.
+// This interface abstracts the commonality between ParameterFlowInfo and FunctionParamCallFlowInfo.
+type flowInfo interface {
+	Index() int
+	IsWrapped() bool
+}
+
+// paramFlowAdapter adapts ParameterFlowInfo to flowInfo interface.
+type paramFlowAdapter struct{ f ParameterFlowInfo }
+
+func (a paramFlowAdapter) Index() int       { return a.f.ParamIndex }
+func (a paramFlowAdapter) IsWrapped() bool  { return a.f.Wrapped }
+
+// funcParamCallFlowAdapter adapts FunctionParamCallFlowInfo to flowInfo interface.
+type funcParamCallFlowAdapter struct{ f FunctionParamCallFlowInfo }
+
+func (a funcParamCallFlowAdapter) Index() int       { return a.f.ParamIndex }
+func (a funcParamCallFlowAdapter) IsWrapped() bool  { return a.f.Wrapped }
+
+// resolveFlowErrors resolves errors from call arguments based on flow information.
+func resolveFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flows []flowInfo) []ErrorInfo {
 	var errs []ErrorInfo
 
-	for _, flow := range flowFact.Flows {
-		if flow.ParamIndex >= len(call.Args) {
+	for _, flow := range flows {
+		if flow.Index() >= len(call.Args) {
 			continue
 		}
 
-		arg := call.Args[flow.ParamIndex]
+		arg := call.Args[flow.Index()]
 		argErrors := extractErrorsFromExpr(pass, arg)
 
 		for _, err := range argErrors {
-			if flow.Wrapped {
+			if flow.IsWrapped() {
 				err.Wrapped = true
 			}
 			errs = append(errs, err)
@@ -506,6 +525,15 @@ func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flow
 	}
 
 	return errs
+}
+
+// resolveParameterFlowErrorsAST resolves errors from call arguments based on ParameterFlowFact.
+func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flowFact *ParameterFlowFact) []ErrorInfo {
+	flows := make([]flowInfo, len(flowFact.Flows))
+	for i, f := range flowFact.Flows {
+		flows[i] = paramFlowAdapter{f}
+	}
+	return resolveFlowErrors(pass, call, flows)
 }
 
 // extractErrorsFromExpr extracts known errors from an expression.
@@ -661,26 +689,11 @@ func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []ErrorInfo
 // resolveFunctionParamCallFlowErrors resolves errors from function parameters that are called.
 // This handles higher-order functions like RunInTx(fn func() error) error { return fn() }
 func resolveFunctionParamCallFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flowFact *FunctionParamCallFlowFact) []ErrorInfo {
-	var errs []ErrorInfo
-
-	for _, flow := range flowFact.CallFlows {
-		if flow.ParamIndex >= len(call.Args) {
-			continue
-		}
-
-		arg := call.Args[flow.ParamIndex]
-		// extractErrorsFromExpr now handles *ast.FuncLit
-		argErrors := extractErrorsFromExpr(pass, arg)
-
-		for _, err := range argErrors {
-			if flow.Wrapped {
-				err.Wrapped = true
-			}
-			errs = append(errs, err)
-		}
+	flows := make([]flowInfo, len(flowFact.CallFlows))
+	for i, f := range flowFact.CallFlows {
+		flows[i] = funcParamCallFlowAdapter{f}
 	}
-
-	return errs
+	return resolveFlowErrors(pass, call, flows)
 }
 
 // findErrorVarInAssignmentWithSig finds the error variable in an assignment statement using a signature.

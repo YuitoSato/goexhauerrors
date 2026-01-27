@@ -651,27 +651,12 @@ func (a *ssaAnalyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ss
 
 // analyzeErrorfWrappingForFunctionParamCalls checks if fmt.Errorf wraps the result of a function parameter call
 func (a *ssaAnalyzer) analyzeErrorfWrappingForFunctionParamCalls(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []FunctionParamCallFlowInfo {
-	args := call.Call.Args
-	if len(args) < 1 {
+	variadicArgs, wrapIndices := getWrappedArgIndices(call)
+	if len(wrapIndices) == 0 {
 		return nil
 	}
-
-	formatStr := extractConstantString(args[0])
-	if formatStr == "" {
-		return nil
-	}
-
-	wrapIndices := findWrapVerbIndices(formatStr)
 
 	var flows []FunctionParamCallFlowInfo
-
-	variadicArgs := args[1:]
-	if len(args) == 2 {
-		if slice, ok := args[1].(*ssa.Slice); ok {
-			variadicArgs = extractSliceElements(slice)
-		}
-	}
-
 	for _, wrapIdx := range wrapIndices {
 		if wrapIdx >= len(variadicArgs) {
 			continue
@@ -819,43 +804,51 @@ func isFmtErrorfSSA(callee *ssa.Function) bool {
 	return callee.Pkg.Pkg.Path() == "fmt" && callee.Name() == "Errorf"
 }
 
-// analyzeErrorfWrapping analyzes fmt.Errorf calls for %w verbs that wrap parameters
-func (a *ssaAnalyzer) analyzeErrorfWrapping(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+// getWrappedArgIndices extracts the wrapped argument indices from a fmt.Errorf call.
+// This is the common logic for analyzing fmt.Errorf wrapping patterns.
+func getWrappedArgIndices(call *ssa.Call) (variadicArgs []ssa.Value, wrapIndices []int) {
 	args := call.Call.Args
 	if len(args) < 1 {
-		return nil
+		return nil, nil
 	}
 
-	// Get format string (first argument)
 	formatStr := extractConstantString(args[0])
 	if formatStr == "" {
-		return nil
+		return nil, nil
 	}
 
-	wrapIndices := findWrapVerbIndices(formatStr)
-
-	var flows []ParameterFlowInfo
+	wrapIndices = findWrapVerbIndices(formatStr)
+	if len(wrapIndices) == 0 {
+		return nil, nil
+	}
 
 	// Handle variadic arguments - they may be passed as a slice
-	// If there are only 2 args and arg[1] is a Slice, unpack it
-	variadicArgs := args[1:]
+	variadicArgs = args[1:]
 	if len(args) == 2 {
-		// Check if the second argument is a slice that was constructed for variadic call
 		if slice, ok := args[1].(*ssa.Slice); ok {
-			// The slice is created from an array allocation
 			variadicArgs = extractSliceElements(slice)
 		}
 	}
 
+	return variadicArgs, wrapIndices
+}
+
+// analyzeErrorfWrapping analyzes fmt.Errorf calls for %w verbs that wrap parameters
+func (a *ssaAnalyzer) analyzeErrorfWrapping(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+	variadicArgs, wrapIndices := getWrappedArgIndices(call)
+	if len(wrapIndices) == 0 {
+		return nil
+	}
+
+	var flows []ParameterFlowInfo
 	for _, wrapIdx := range wrapIndices {
 		if wrapIdx >= len(variadicArgs) {
 			continue
 		}
 
-		// Trace this argument to see if it's a parameter
 		paramFlows := a.traceValueToParameters(variadicArgs[wrapIdx], params, visited, depth+1)
 		for i := range paramFlows {
-			paramFlows[i].Wrapped = true // Mark as wrapped
+			paramFlows[i].Wrapped = true
 		}
 		flows = append(flows, paramFlows...)
 	}
