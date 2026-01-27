@@ -288,6 +288,15 @@ func Handler() error {
 }
 ```
 
+Wrapping with `fmt.Errorf` using `%w` is also treated as propagation since the original error is still detectable via `errors.Is`:
+
+```go
+func Handler() error {
+    _, err := GetItem("test")
+    return fmt.Errorf("handler failed: %w", err)  // OK - error is wrapped but still detectable
+}
+```
+
 ### Variable Reassignment
 
 After reassignment, only the new error types are tracked:
