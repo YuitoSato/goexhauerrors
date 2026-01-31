@@ -19,14 +19,46 @@ func newInterfaceImplementations() *interfaceImplementations {
 	}
 }
 
-// findInterfaceImplementations discovers all interface implementations in the package.
-// It scans all named types and checks if they implement any interfaces defined in the package.
+// findInterfaceImplementations discovers all interface implementations visible from the package.
+// It scans named types in the current package and all directly imported packages,
+// and checks if they implement any interfaces also visible from the package.
 func findInterfaceImplementations(pass *analysis.Pass) *interfaceImplementations {
 	impl := newInterfaceImplementations()
 
-	// Collect all interfaces defined in the package
+	// Collect interfaces from current package + imported packages
 	var interfaces []*types.Interface
-	scope := pass.Pkg.Scope()
+	collectInterfaces(pass.Pkg.Scope(), &interfaces)
+	for _, imp := range pass.Pkg.Imports() {
+		collectInterfaces(imp.Scope(), &interfaces)
+	}
+
+	if len(interfaces) == 0 {
+		return impl
+	}
+
+	// Collect named types from current package + imported packages
+	var namedTypes []*types.Named
+	collectNamedTypes(pass.Pkg.Scope(), &namedTypes)
+	for _, imp := range pass.Pkg.Imports() {
+		collectNamedTypes(imp.Scope(), &namedTypes)
+	}
+
+	// For each interface, find implementing types
+	for _, iface := range interfaces {
+		for _, named := range namedTypes {
+			if types.Implements(named, iface) {
+				impl.implementations[iface] = append(impl.implementations[iface], named)
+			} else if ptr := types.NewPointer(named); types.Implements(ptr, iface) {
+				impl.implementations[iface] = append(impl.implementations[iface], named)
+			}
+		}
+	}
+
+	return impl
+}
+
+// collectInterfaces scans a scope and appends all interface types found.
+func collectInterfaces(scope *types.Scope, interfaces *[]*types.Interface) {
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
 		typeName, ok := obj.(*types.TypeName)
@@ -34,16 +66,13 @@ func findInterfaceImplementations(pass *analysis.Pass) *interfaceImplementations
 			continue
 		}
 		if iface, ok := typeName.Type().Underlying().(*types.Interface); ok {
-			interfaces = append(interfaces, iface)
+			*interfaces = append(*interfaces, iface)
 		}
 	}
+}
 
-	if len(interfaces) == 0 {
-		return impl
-	}
-
-	// Collect all named types in the package
-	var namedTypes []*types.Named
+// collectNamedTypes scans a scope and appends all non-interface named types found.
+func collectNamedTypes(scope *types.Scope, namedTypes *[]*types.Named) {
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
 		typeName, ok := obj.(*types.TypeName)
@@ -55,24 +84,9 @@ func findInterfaceImplementations(pass *analysis.Pass) *interfaceImplementations
 			if _, isIface := named.Underlying().(*types.Interface); isIface {
 				continue
 			}
-			namedTypes = append(namedTypes, named)
+			*namedTypes = append(*namedTypes, named)
 		}
 	}
-
-	// For each interface, find implementing types
-	for _, iface := range interfaces {
-		for _, named := range namedTypes {
-			// Check if T implements the interface
-			if types.Implements(named, iface) {
-				impl.implementations[iface] = append(impl.implementations[iface], named)
-			} else if ptr := types.NewPointer(named); types.Implements(ptr, iface) {
-				// Check if *T implements the interface
-				impl.implementations[iface] = append(impl.implementations[iface], named)
-			}
-		}
-	}
-
-	return impl
 }
 
 // getImplementingTypes returns all types that implement the given interface.

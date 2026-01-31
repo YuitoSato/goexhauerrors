@@ -22,7 +22,7 @@ type funcInfo struct {
 // It uses iterative analysis to handle factory functions that call other
 // functions returning errors, combined with SSA-based analysis to track
 // errors through variables.
-func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
+func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*types.Func]*FunctionErrorsFact, map[*types.Func]*ParameterFlowFact, *interfaceImplementations) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// Discover interface implementations in this package
@@ -165,8 +165,8 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) {
 		}
 	}
 
-	// Compute and export InterfaceMethodFact for interface methods
-	computeInterfaceMethodFacts(pass, localFacts, interfaceImpls)
+	// Return data needed for interface method facts (computed after analyzeParameterErrorChecks)
+	return localFacts, localParamFlowFacts, interfaceImpls
 }
 
 // buildValidErrors creates a set of valid error keys that can be used in FunctionErrorsFact.
@@ -757,9 +757,12 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 	}
 }
 
-// computeInterfaceMethodFacts computes and exports InterfaceMethodFact for each
-// interface method in the package. It collects errors from all known implementations.
-func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*FunctionErrorsFact, impls *interfaceImplementations) {
+// computeInterfaceMethodFacts computes and exports InterfaceMethodFact, ParameterFlowFact,
+// and ParameterCheckedErrorsFact for each interface method in the package.
+// It collects errors from all known implementations.
+// For ParameterFlowFact and ParameterCheckedErrorsFact, intersection semantics is used
+// (a fact is only exported if ALL implementations agree).
+func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, impls *interfaceImplementations) {
 	scope := pass.Pkg.Scope()
 
 	// For each interface defined in this package
@@ -785,8 +788,10 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 			}
 
 			fact := &InterfaceMethodFact{}
+			var allParamFlowFacts []*ParameterFlowFact
+			var allCheckedFacts []*ParameterCheckedErrorsFact
 
-			// Collect errors from all implementations
+			// Collect facts from all implementations
 			implementingTypes := impls.getImplementingTypes(ifaceType)
 			for _, concreteType := range implementingTypes {
 				method := findMethodImplementation(concreteType, ifaceMethod)
@@ -794,21 +799,58 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 					continue
 				}
 
-				// Check local facts first
+				// FunctionErrorsFact (union)
 				if localFact, ok := localFacts[method]; ok {
 					fact.AddErrors(localFact.Errors)
 				}
-
-				// Also check imported facts
 				var fnFact FunctionErrorsFact
 				if pass.ImportObjectFact(method, &fnFact) {
 					fact.AddErrors(fnFact.Errors)
 				}
+
+				// ParameterFlowFact (collect for intersection)
+				var pf *ParameterFlowFact
+				if localPF, ok := localParamFlowFacts[method]; ok {
+					pf = localPF
+				}
+				var importedPF ParameterFlowFact
+				if pass.ImportObjectFact(method, &importedPF) {
+					if pf == nil {
+						pf = &importedPF
+					} else {
+						pf.Merge(&importedPF)
+					}
+				}
+				allParamFlowFacts = append(allParamFlowFacts, pf)
+
+				// ParameterCheckedErrorsFact (collect for intersection)
+				var cf *ParameterCheckedErrorsFact
+				var importedCF ParameterCheckedErrorsFact
+				if pass.ImportObjectFact(method, &importedCF) {
+					cf = &importedCF
+				}
+				allCheckedFacts = append(allCheckedFacts, cf)
 			}
 
-			// Export the fact if we found any errors
+			// Export InterfaceMethodFact (union of errors)
 			if len(fact.Errors) > 0 {
 				pass.ExportObjectFact(ifaceMethod, fact)
+			}
+
+			// Export ParameterFlowFact (intersection across implementations)
+			if len(allParamFlowFacts) > 0 {
+				intersectedFlow := intersectParameterFlowFacts(allParamFlowFacts)
+				if intersectedFlow != nil && len(intersectedFlow.Flows) > 0 {
+					pass.ExportObjectFact(ifaceMethod, intersectedFlow)
+				}
+			}
+
+			// Export ParameterCheckedErrorsFact (intersection across implementations)
+			if len(allCheckedFacts) > 0 {
+				intersectedChecked := intersectParameterCheckedErrorsFacts(allCheckedFacts)
+				if intersectedChecked != nil && len(intersectedChecked.Checks) > 0 {
+					pass.ExportObjectFact(ifaceMethod, intersectedChecked)
+				}
 			}
 		}
 	}
