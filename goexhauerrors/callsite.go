@@ -977,7 +977,7 @@ func resolveFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flows []flowInfo
 	var errs []ErrorInfo
 
 	for _, flow := range flows {
-		if flow.Index() >= len(call.Args) {
+		if flow.Index() < 0 || flow.Index() >= len(call.Args) {
 			continue
 		}
 
