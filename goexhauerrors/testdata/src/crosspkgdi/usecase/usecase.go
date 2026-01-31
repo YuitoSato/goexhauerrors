@@ -37,6 +37,16 @@ func (uc *GetUseCase) BadCallerSave(id string, value string) {
 	}
 }
 
+// MixedCaller calls both a regular function and an interface method without checking errors.
+// This tests that each diagnostic is reported exactly once, even when deferred re-analysis
+// re-walks the function body (the regular call's error must not be duplicated).
+func (uc *GetUseCase) MixedCaller(id string) {
+	err := domain.Validate(id) // want "missing errors.Is check for crosspkgdi/domain.ErrNotFound"
+	log.Println(err)
+	_, err = uc.repo.FindByID(id) // want "missing errors.Is check for crosspkgdi/domain.ErrNotFound"
+	log.Println(err)
+}
+
 // GoodCaller checks all errors — no warning.
 func (uc *GetUseCase) GoodCaller(id string) (string, error) {
 	val, err := uc.repo.FindByID(id)

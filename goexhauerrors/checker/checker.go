@@ -14,9 +14,10 @@ import (
 
 // CallSiteAnalyzer holds context for call site analysis to avoid recomputing expensive data.
 type CallSiteAnalyzer struct {
-	Pass              *analysis.Pass
-	InterfaceImpls    *internal.InterfaceImplementations
-	hadGlobalStoreMiss bool // set to true if any interface method lookup missed the global store
+	Pass               *analysis.Pass
+	InterfaceImpls     *internal.InterfaceImplementations
+	hadGlobalStoreMiss bool                          // set to true if any interface method lookup missed the global store
+	reported           map[token.Pos]map[string]bool // tracks (callPos, errorKey) already reported to prevent duplicates
 }
 
 // CheckCallSites checks all call sites to ensure errors are properly checked.
@@ -28,6 +29,7 @@ func checkCallSitesInternal(pass *analysis.Pass, interfaceImpls *internal.Interf
 	csa := &CallSiteAnalyzer{
 		Pass:           pass,
 		InterfaceImpls: interfaceImpls,
+		reported:       make(map[token.Pos]map[string]bool),
 	}
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -90,11 +92,13 @@ func checkCallSitesInternal(pass *analysis.Pass, interfaceImpls *internal.Interf
 		capturedPass := pass
 		capturedImpls := interfaceImpls
 		capturedFuncs := missedFuncs
+		capturedReported := csa.reported
 		facts.AddDeferredFunctionCheck(&facts.DeferredFunctionCheck{
 			ReAnalyze: func() bool {
 				reAnalyzer := &CallSiteAnalyzer{
 					Pass:           capturedPass,
 					InterfaceImpls: capturedImpls,
+					reported:       capturedReported,
 				}
 				stillHasMiss := false
 				for _, f := range capturedFuncs {
@@ -148,7 +152,7 @@ func (csa *CallSiteAnalyzer) checkFunctionBody(body *ast.BlockStmt, canPropagate
 
 	// Report any remaining unchecked errors at end of function
 	for _, state := range states {
-		reportUncheckedErrors(csa.Pass, state)
+		reportUncheckedErrors(csa.Pass, state, csa.reported)
 	}
 }
 
@@ -191,7 +195,7 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 
 			// If this variable already has active errors, report unchecked ones
 			if existingState, ok := states[errorVar]; ok {
-				reportUncheckedErrors(pass, existingState)
+				reportUncheckedErrors(pass, existingState, csa.reported)
 			}
 
 			// Set new state for this variable
@@ -682,7 +686,9 @@ func markPartialCheckedErrors(state *errorVarState, checkedFact *facts.Parameter
 }
 
 // reportUncheckedErrors reports any errors that haven't been checked.
-func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
+// The reported map tracks (callPos, errorKey) pairs already reported to prevent
+// duplicate diagnostics when deferred re-analysis re-walks the same function body.
+func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState, reported map[token.Pos]map[string]bool) {
 	for _, errInfo := range state.errors {
 		// Skip ignored packages
 		if internal.ShouldIgnorePackage(errInfo.PkgPath) {
@@ -695,6 +701,16 @@ func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
 		}
 		key := errInfo.Key()
 		if !state.checked[key] {
+			// Skip if already reported (prevents duplicates across first-pass and deferred re-analysis)
+			if reported != nil {
+				if reported[state.callPos][key] {
+					continue
+				}
+				if reported[state.callPos] == nil {
+					reported[state.callPos] = make(map[string]bool)
+				}
+				reported[state.callPos][key] = true
+			}
 			pass.Reportf(state.callPos, "missing errors.Is check for %s", key)
 		}
 	}
