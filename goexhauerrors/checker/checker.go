@@ -88,9 +88,10 @@ func funcReturnsError(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
 
 // errorVarState tracks the active errors for an error variable.
 type errorVarState struct {
-	callPos token.Pos
-	errors  []facts.ErrorInfo
-	checked map[string]bool
+	callPos          token.Pos
+	errors           []facts.ErrorInfo
+	checked          map[string]bool
+	propagatableKeys map[string]bool // if non-nil, only these error keys can be propagated via return
 }
 
 // checkFunctionBody checks all call sites within a function body using flow-sensitive analysis.
@@ -215,13 +216,16 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 		if s.Body != nil {
 			for _, clause := range s.Body.List {
 				if cc, ok := clause.(*ast.CaseClause); ok {
-					// Check case expressions for errors.Is
+					// Clone states FIRST so case condition checks are scoped to this case only
+					caseStates := cloneStates(states)
+
+					// Check case expressions for errors.Is (scoped to caseStates)
 					for _, expr := range cc.List {
-						collectErrorsIsInExpr(pass, expr, states)
+						collectErrorsIsInExpr(pass, expr, caseStates)
 					}
 					// Check case values as direct comparisons against switch tag
 					if switchTagVar != nil {
-						if state, ok := states[switchTagVar]; ok {
+						if state, ok := caseStates[switchTagVar]; ok {
 							for _, expr := range cc.List {
 								errorKey := internal.ExtractErrorKey(pass, expr)
 								if errorKey != "" {
@@ -230,8 +234,10 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 							}
 						}
 					}
+
+					applyPropagationNarrowing(caseStates, states)
+
 					// Walk case body
-					caseStates := cloneStates(states)
 					csa.walkStatementsWithScope(cc.Body, caseStates, canPropagate)
 					// Merge back checked errors
 					for varObj, caseState := range caseStates {
@@ -282,9 +288,12 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 		if s.Body != nil {
 			for _, clause := range s.Body.List {
 				if cc, ok := clause.(*ast.CaseClause); ok {
+					// Clone states FIRST so type checks are scoped to this case only
+					caseStates := cloneStates(states)
+
 					// Check if any case type matches a tracked error type
 					if switchVar != nil {
-						if state, ok := states[switchVar]; ok {
+						if state, ok := caseStates[switchVar]; ok {
 							for _, caseExpr := range cc.List {
 								typeName := internal.ExtractTypeNameFromExpr(pass, caseExpr)
 								if typeName != "" {
@@ -294,8 +303,9 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 						}
 					}
 
+					applyPropagationNarrowing(caseStates, states)
+
 					// Walk case body
-					caseStates := cloneStates(states)
 					csa.walkStatementsWithScope(cc.Body, caseStates, canPropagate)
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
@@ -314,9 +324,14 @@ func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 			for _, result := range s.Results {
 				if csa.isVariablePropagatedInReturn(result, varObj) {
 					if canPropagate {
-						// Mark all errors as "checked" since we're propagating
+						// Mark errors as "checked" since we're propagating.
+						// If propagatableKeys is set (inside a switch case with errors.Is narrowing),
+						// only propagate the narrowed errors, not all errors.
 						for _, errInfo := range state.errors {
-							state.checked[errInfo.Key()] = true
+							key := errInfo.Key()
+							if state.propagatableKeys == nil || state.propagatableKeys[key] {
+								state.checked[key] = true
+							}
 						}
 					}
 				} else {
@@ -649,13 +664,42 @@ func cloneStates(states map[*types.Var]*errorVarState) map[*types.Var]*errorVarS
 		for k, v := range state.checked {
 			newChecked[k] = v
 		}
+		var newPropKeys map[string]bool
+		if state.propagatableKeys != nil {
+			newPropKeys = make(map[string]bool)
+			for k, v := range state.propagatableKeys {
+				newPropKeys[k] = v
+			}
+		}
 		result[varObj] = &errorVarState{
-			callPos: state.callPos,
-			errors:  state.errors, // Slice is fine to share as we don't modify it
-			checked: newChecked,
+			callPos:          state.callPos,
+			errors:           state.errors, // Slice is fine to share as we don't modify it
+			checked:          newChecked,
+			propagatableKeys: newPropKeys,
 		}
 	}
 	return result
+}
+
+// applyPropagationNarrowing sets propagatableKeys on caseStates based on
+// which errors were newly checked by the case condition (not present in parent states).
+// If the case narrows to specific errors (via errors.Is or direct comparison),
+// only those errors will be propagatable via return in the case body.
+// If no narrowing is detected (catch-all), propagatableKeys stays nil, allowing all.
+func applyPropagationNarrowing(caseStates, parentStates map[*types.Var]*errorVarState) {
+	for varObj, caseState := range caseStates {
+		if parentState, ok := parentStates[varObj]; ok {
+			narrowed := make(map[string]bool)
+			for key := range caseState.checked {
+				if !parentState.checked[key] {
+					narrowed[key] = true
+				}
+			}
+			if len(narrowed) > 0 {
+				caseState.propagatableKeys = narrowed
+			}
+		}
+	}
 }
 
 // mergeStates merges branch states back into the main states.
