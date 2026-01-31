@@ -56,8 +56,18 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// Phase 2d: Compute interface method facts (after ParameterCheckedErrorsFact is available)
 	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
 
+	// Phase 2e: Compute interface method facts for imported interfaces (DI pattern support)
+	analyzer.ComputeImportedInterfaceMethodFacts(pass, localFacts, interfaceImpls)
+
 	// Phase 3: Check call sites for exhaustive errors.Is checks
 	checker.CheckCallSites(pass, interfaceImpls)
+
+	// Phase 4: Process deferred function checks from earlier packages.
+	// When a checker couldn't find interface method errors in the global store
+	// (because the implementation package hadn't been analyzed yet), it registers
+	// a deferred re-analysis callback. By now, this package's facts are in the
+	// global store, so deferred functions may find what they need.
+	facts.ProcessDeferredFunctionChecks()
 
 	return nil, nil
 }

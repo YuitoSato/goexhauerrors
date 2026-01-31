@@ -726,6 +726,64 @@ func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 	}
 }
 
+// ComputeImportedInterfaceMethodFacts computes InterfaceMethodFact for interfaces
+// defined in imported packages, using implementations found in the current package.
+// This handles the DI pattern where the interface is in package A (e.g., domain),
+// the implementation is in package B (e.g., infra), and the caller is in package C
+// (e.g., usecase) which imports A but not B. By storing facts in a global store
+// from B, C can later look them up even without importing B.
+func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, impls *internal.InterfaceImplementations) {
+	for _, imp := range pass.Pkg.Imports() {
+		impScope := imp.Scope()
+		for _, name := range impScope.Names() {
+			obj := impScope.Lookup(name)
+			typeName, ok := obj.(*types.TypeName)
+			if !ok {
+				continue
+			}
+
+			ifaceType, ok := typeName.Type().Underlying().(*types.Interface)
+			if !ok {
+				continue
+			}
+
+			// Find implementations of this imported interface in the current package
+			implementingTypes := impls.GetImplementingTypes(ifaceType)
+			if len(implementingTypes) == 0 {
+				continue
+			}
+
+			for i := 0; i < ifaceType.NumMethods(); i++ {
+				ifaceMethod := ifaceType.Method(i)
+
+				fact := &facts.InterfaceMethodFact{}
+
+				for _, concreteType := range implementingTypes {
+					method := internal.FindMethodImplementation(concreteType, ifaceMethod)
+					if method == nil {
+						continue
+					}
+
+					// Collect errors from local implementations
+					if localFact, ok := localFacts[method]; ok {
+						fact.AddErrors(localFact.Errors)
+					}
+					var fnFact facts.FunctionErrorsFact
+					if pass.ImportObjectFact(method, &fnFact) {
+						fact.AddErrors(fnFact.Errors)
+					}
+				}
+
+				if len(fact.Errors) > 0 {
+					// Store in global store so callers that don't import this package can find it
+					key := facts.InterfaceMethodKey(imp.Path(), typeName.Name(), ifaceMethod.Name())
+					facts.MergeInterfaceMethodFact(key, fact)
+				}
+			}
+		}
+	}
+}
+
 // AnalyzeParameterErrorChecks analyzes all functions to detect errors.Is/As checks
 // performed on error-typed parameters inside the function body.
 // This allows callers to know which errors are already checked inside the function.

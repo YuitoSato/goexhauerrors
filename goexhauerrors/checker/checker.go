@@ -14,18 +14,30 @@ import (
 
 // CallSiteAnalyzer holds context for call site analysis to avoid recomputing expensive data.
 type CallSiteAnalyzer struct {
-	Pass           *analysis.Pass
-	InterfaceImpls *internal.InterfaceImplementations
+	Pass              *analysis.Pass
+	InterfaceImpls    *internal.InterfaceImplementations
+	hadGlobalStoreMiss bool // set to true if any interface method lookup missed the global store
 }
 
 // CheckCallSites checks all call sites to ensure errors are properly checked.
 func CheckCallSites(pass *analysis.Pass, interfaceImpls *internal.InterfaceImplementations) {
+	checkCallSitesInternal(pass, interfaceImpls, true)
+}
+
+func checkCallSitesInternal(pass *analysis.Pass, interfaceImpls *internal.InterfaceImplementations, registerDeferred bool) {
 	csa := &CallSiteAnalyzer{
 		Pass:           pass,
 		InterfaceImpls: interfaceImpls,
 	}
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
+	// Collect functions that had global store misses for deferred re-analysis
+	type funcToCheck struct {
+		body         *ast.BlockStmt
+		returnsError bool
+	}
+	var missedFuncs []funcToCheck
 
 	nodeFilter := []ast.Node{
 		(*ast.FuncDecl)(nil),
@@ -39,7 +51,11 @@ func CheckCallSites(pass *analysis.Pass, interfaceImpls *internal.InterfaceImple
 				return
 			}
 			returnsError := funcReturnsError(pass, node)
+			csa.hadGlobalStoreMiss = false
 			csa.checkFunctionBody(node.Body, returnsError)
+			if csa.hadGlobalStoreMiss && registerDeferred {
+				missedFuncs = append(missedFuncs, funcToCheck{node.Body, returnsError})
+			}
 
 		case *ast.FuncLit:
 			if node.Body == nil {
@@ -61,9 +77,37 @@ func CheckCallSites(pass *analysis.Pass, interfaceImpls *internal.InterfaceImple
 					break
 				}
 			}
+			csa.hadGlobalStoreMiss = false
 			csa.checkFunctionBody(node.Body, returnsError)
+			if csa.hadGlobalStoreMiss && registerDeferred {
+				missedFuncs = append(missedFuncs, funcToCheck{node.Body, returnsError})
+			}
 		}
 	})
+
+	// Register deferred re-analysis for functions that had global store misses
+	if len(missedFuncs) > 0 && registerDeferred {
+		capturedPass := pass
+		capturedImpls := interfaceImpls
+		capturedFuncs := missedFuncs
+		facts.AddDeferredFunctionCheck(&facts.DeferredFunctionCheck{
+			ReAnalyze: func() bool {
+				reAnalyzer := &CallSiteAnalyzer{
+					Pass:           capturedPass,
+					InterfaceImpls: capturedImpls,
+				}
+				stillHasMiss := false
+				for _, f := range capturedFuncs {
+					reAnalyzer.hadGlobalStoreMiss = false
+					reAnalyzer.checkFunctionBody(f.body, f.returnsError)
+					if reAnalyzer.hadGlobalStoreMiss {
+						stillHasMiss = true
+					}
+				}
+				return stillHasMiss
+			},
+		})
+	}
 }
 
 // funcReturnsError checks if the function returns an error type.
@@ -856,6 +900,17 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*f
 		return &facts.FunctionErrorsFact{Errors: ifaceFact.Errors}, sig
 	}
 
+	// Fallback: check the global store for cross-package DI pattern.
+	// This handles the case where the implementation package is not in the caller's import graph.
+	if ifaceTypeName := findInterfaceTypeName(pass, ifaceType); ifaceTypeName != nil {
+		key := facts.InterfaceMethodKey(ifaceTypeName.Pkg().Path(), ifaceTypeName.Name(), method.Name())
+		if globalFact, ok := facts.LoadInterfaceMethodFact(key); ok {
+			return &facts.FunctionErrorsFact{Errors: globalFact.Errors}, sig
+		}
+		// Mark that we had a global store miss so the caller can register for deferred re-analysis
+		csa.hadGlobalStoreMiss = true
+	}
+
 	// If no fact found, try to find implementations in the current package
 	// This handles the case where the interface and implementations are in the same package
 	implementingTypes := csa.InterfaceImpls.GetImplementingTypes(ifaceType)
@@ -878,6 +933,38 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*f
 	}
 
 	return nil, nil
+}
+
+// findInterfaceTypeName finds the *types.TypeName for a given interface type
+// by searching the package scope and imported package scopes.
+func findInterfaceTypeName(pass *analysis.Pass, ifaceType *types.Interface) *types.TypeName {
+	// Search current package scope
+	if tn := findInterfaceTypeNameInScope(pass.Pkg.Scope(), ifaceType); tn != nil {
+		return tn
+	}
+	// Search imported package scopes
+	for _, imp := range pass.Pkg.Imports() {
+		if tn := findInterfaceTypeNameInScope(imp.Scope(), ifaceType); tn != nil {
+			return tn
+		}
+	}
+	return nil
+}
+
+func findInterfaceTypeNameInScope(scope *types.Scope, ifaceType *types.Interface) *types.TypeName {
+	for _, name := range scope.Names() {
+		obj := scope.Lookup(name)
+		tn, ok := obj.(*types.TypeName)
+		if !ok {
+			continue
+		}
+		if iface, ok := tn.Type().Underlying().(*types.Interface); ok {
+			if types.Identical(iface, ifaceType) {
+				return tn
+			}
+		}
+	}
+	return nil
 }
 
 // getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
