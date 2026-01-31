@@ -297,6 +297,71 @@ func Handler() error {
 }
 ```
 
+Note: `fmt.Errorf` with `%v` is NOT treated as propagation because the original error is lost and cannot be detected via `errors.Is`:
+
+```go
+func Handler() error {
+    _, err := GetItem("test")
+    return fmt.Errorf("handler failed: %v", err)  // Warning: missing errors.Is check
+}
+```
+
+### Error Checking Inside Called Functions
+
+When a function receives an error parameter and checks it with `errors.Is`/`errors.As` internally, those checks are reflected to the caller. Only the **unchecked** errors are reported:
+
+```go
+var ErrNotFound = errors.New("not found")
+var ErrPermission = errors.New("permission denied")
+var ErrTimeout = errors.New("timeout")
+
+func GetItem() error { /* returns all three errors */ }
+
+// MapError checks 2 of 3 errors internally
+func MapError(err error) error {
+    if errors.Is(err, ErrNotFound) {
+        return errors.New("mapped: not found")
+    }
+    if errors.Is(err, ErrPermission) {
+        return errors.New("mapped: permission denied")
+    }
+    // ErrTimeout is NOT checked
+    return nil
+}
+
+func Caller() error {
+    err := GetItem()
+    return MapError(err)  // Warning: missing errors.Is check for ErrTimeout
+    // ErrNotFound and ErrPermission are already checked inside MapError
+}
+```
+
+If the function checks **all** possible errors, no warning is reported:
+
+```go
+func MapErrorComplete(err error) error {
+    if errors.Is(err, ErrNotFound) { return errors.New("mapped") }
+    if errors.Is(err, ErrPermission) { return errors.New("mapped") }
+    if errors.Is(err, ErrTimeout) { return errors.New("mapped") }
+    return nil
+}
+
+func CallerGood() error {
+    err := GetItem()
+    return MapErrorComplete(err)  // OK - all errors checked inside MapErrorComplete
+}
+```
+
+This also works with assignment (non-return) patterns:
+
+```go
+func CallerAssign() error {
+    err := GetItem()
+    result := MapError(err)  // Warning: missing errors.Is check for ErrTimeout
+    return result
+}
+```
+
 ### Variable Reassignment
 
 After reassignment, only the new error types are tracked:
@@ -390,6 +455,7 @@ func CreateError(msg string) error {
 | | Variable reassignment | Yes |
 | | Concrete type methods | Yes |
 | | Function parameters | Yes |
+| | Error checks inside called functions | Yes |
 | | Interface method calls | Yes |
 | | Higher-order functions (lambda) | Yes |
 | Not Supported | Unexported errors | No (by design) |
