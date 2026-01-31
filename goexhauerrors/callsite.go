@@ -480,6 +480,12 @@ func isVariablePropagatedInReturn(pass *analysis.Pass, result ast.Expr, targetVa
 			if pass.ImportObjectFact(calledFn, &flowFact) {
 				return flowFact.HasFlowForParam(argIndex)
 			}
+			// Fallback for cross-package interface methods
+			if sel, ok := expr.Fun.(*ast.SelectorExpr); ok {
+				if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+					return ifaceFlowFact.HasFlowForParam(argIndex)
+				}
+			}
 			// Function was analyzed but has no ParameterFlowFact → NOT propagation
 			return false
 		}
@@ -549,6 +555,24 @@ func markTransferredErrorArgs(pass *analysis.Pass, call *ast.CallExpr, states ma
 	var checkedFact ParameterCheckedErrorsFact
 	hasCheckedFact := pass.ImportObjectFact(calledFn, &checkedFact)
 
+	// Fallback for cross-package interface methods: dynamically compute from implementations
+	if !hasFlowFact || !hasCheckedFact {
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			if !hasFlowFact {
+				if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+					flowFact = *ifaceFlowFact
+					hasFlowFact = true
+				}
+			}
+			if !hasCheckedFact {
+				if ifaceCheckedFact := getInterfaceMethodCheckedErrors(pass, sel); ifaceCheckedFact != nil {
+					checkedFact = *ifaceCheckedFact
+					hasCheckedFact = true
+				}
+			}
+		}
+	}
+
 	if !hasFlowFact && !hasCheckedFact {
 		return
 	}
@@ -600,6 +624,11 @@ func markCheckedErrorsFromCall(pass *analysis.Pass, result ast.Expr, targetVar *
 	var checkedFact ParameterCheckedErrorsFact
 	if pass.ImportObjectFact(calledFn, &checkedFact) {
 		markPartialCheckedErrors(state, &checkedFact, argIndex)
+	} else if sel, ok := result.(*ast.CallExpr).Fun.(*ast.SelectorExpr); ok {
+		// Fallback for cross-package interface methods
+		if ifaceCheckedFact := getInterfaceMethodCheckedErrors(pass, sel); ifaceCheckedFact != nil {
+			markPartialCheckedErrors(state, ifaceCheckedFact, argIndex)
+		}
 	}
 }
 
@@ -698,6 +727,15 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 			paramFlowErrors := resolveParameterFlowErrorsAST(pass, call, &flowFact)
 			for _, err := range paramFlowErrors {
 				result.AddError(err)
+			}
+		} else if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			// Fallback for cross-package interface methods: dynamically compute
+			// intersection of ParameterFlowFact from implementations
+			if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+				paramFlowErrors := resolveParameterFlowErrorsAST(pass, call, ifaceFlowFact)
+				for _, err := range paramFlowErrors {
+					result.AddError(err)
+				}
 			}
 		}
 
@@ -813,6 +851,106 @@ func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*Func
 	}
 
 	return nil, nil
+}
+
+// getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
+// from all implementations of an interface method.
+// Returns nil if the receiver is not an interface type or no implementations have flow facts.
+func getInterfaceMethodParameterFlow(pass *analysis.Pass, sel *ast.SelectorExpr) *ParameterFlowFact {
+	tv := pass.TypesInfo.Types[sel.X]
+	if !tv.IsValue() {
+		return nil
+	}
+
+	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+
+	methodObj := pass.TypesInfo.Uses[sel.Sel]
+	method, ok := methodObj.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Check for ParameterFlowFact directly on the interface method
+	var flowFact ParameterFlowFact
+	if pass.ImportObjectFact(method, &flowFact) {
+		return &flowFact
+	}
+
+	// Dynamically compute intersection from implementations
+	impls := findInterfaceImplementations(pass)
+	implementingTypes := impls.getImplementingTypes(ifaceType)
+	if len(implementingTypes) == 0 {
+		return nil
+	}
+
+	var allFlowFacts []*ParameterFlowFact
+	for _, concreteType := range implementingTypes {
+		concreteMethod := findMethodImplementation(concreteType, method)
+		if concreteMethod == nil {
+			continue
+		}
+		var pf ParameterFlowFact
+		if pass.ImportObjectFact(concreteMethod, &pf) {
+			allFlowFacts = append(allFlowFacts, &pf)
+		} else {
+			allFlowFacts = append(allFlowFacts, nil)
+		}
+	}
+
+	return intersectParameterFlowFacts(allFlowFacts)
+}
+
+// getInterfaceMethodCheckedErrors returns the intersection of ParameterCheckedErrorsFact
+// from all implementations of an interface method.
+// Returns nil if the receiver is not an interface type or no implementations have checked facts.
+func getInterfaceMethodCheckedErrors(pass *analysis.Pass, sel *ast.SelectorExpr) *ParameterCheckedErrorsFact {
+	tv := pass.TypesInfo.Types[sel.X]
+	if !tv.IsValue() {
+		return nil
+	}
+
+	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+
+	methodObj := pass.TypesInfo.Uses[sel.Sel]
+	method, ok := methodObj.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Check for ParameterCheckedErrorsFact directly on the interface method
+	var checkedFact ParameterCheckedErrorsFact
+	if pass.ImportObjectFact(method, &checkedFact) {
+		return &checkedFact
+	}
+
+	// Dynamically compute intersection from implementations
+	impls := findInterfaceImplementations(pass)
+	implementingTypes := impls.getImplementingTypes(ifaceType)
+	if len(implementingTypes) == 0 {
+		return nil
+	}
+
+	var allCheckedFacts []*ParameterCheckedErrorsFact
+	for _, concreteType := range implementingTypes {
+		concreteMethod := findMethodImplementation(concreteType, method)
+		if concreteMethod == nil {
+			continue
+		}
+		var cf ParameterCheckedErrorsFact
+		if pass.ImportObjectFact(concreteMethod, &cf) {
+			allCheckedFacts = append(allCheckedFacts, &cf)
+		} else {
+			allCheckedFacts = append(allCheckedFacts, nil)
+		}
+	}
+
+	return intersectParameterCheckedErrorsFacts(allCheckedFacts)
 }
 
 // flowInfo represents a parameter flow with index and wrapped flag.

@@ -34,6 +34,11 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgmethod/presentation",
 		"deferselect",
 		"funclit",
+		"ifaceparamflow",
+		"ifacechecked",
+		"crosspkgiface/iface",
+		"crosspkgiface/impl",
+		"crosspkgiface/caller",
 	)
 }
 

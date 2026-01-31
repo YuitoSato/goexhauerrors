@@ -324,3 +324,89 @@ func (f *ParameterCheckedErrorsFact) GetCheckedErrors(paramIndex int) []ErrorInf
 	}
 	return nil
 }
+
+// intersectParameterFlowFacts computes the intersection of ParameterFlowFact across implementations.
+// A parameter flow is kept only if it exists in ALL non-nil facts.
+// If any fact is nil (implementation has no flow), the intersection is empty.
+func intersectParameterFlowFacts(facts []*ParameterFlowFact) *ParameterFlowFact {
+	if len(facts) == 0 {
+		return nil
+	}
+
+	// If any implementation has no ParameterFlowFact, intersection is empty
+	for _, f := range facts {
+		if f == nil || len(f.Flows) == 0 {
+			return nil
+		}
+	}
+
+	// Start with the first fact's flows, keep only those present in all others
+	result := &ParameterFlowFact{}
+	for _, flow := range facts[0].Flows {
+		presentInAll := true
+		for _, other := range facts[1:] {
+			if !other.HasFlowForParam(flow.ParamIndex) {
+				presentInAll = false
+				break
+			}
+		}
+		if presentInAll {
+			result.AddFlow(flow)
+		}
+	}
+
+	if len(result.Flows) == 0 {
+		return nil
+	}
+	return result
+}
+
+// intersectParameterCheckedErrorsFacts computes the intersection of ParameterCheckedErrorsFact across implementations.
+// An error check is kept only if it exists in ALL non-nil facts.
+// If any fact is nil, the intersection is empty.
+func intersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *ParameterCheckedErrorsFact {
+	if len(facts) == 0 {
+		return nil
+	}
+
+	// If any implementation has no ParameterCheckedErrorsFact, intersection is empty
+	for _, f := range facts {
+		if f == nil || len(f.Checks) == 0 {
+			return nil
+		}
+	}
+
+	// For each param index in the first fact, keep only errors checked in ALL facts
+	result := &ParameterCheckedErrorsFact{}
+	for _, check := range facts[0].Checks {
+		for _, errInfo := range check.CheckedErrors {
+			checkedInAll := true
+			for _, other := range facts[1:] {
+				otherChecked := other.GetCheckedErrors(check.ParamIndex)
+				if !containsErrorInfo(otherChecked, errInfo) {
+					checkedInAll = false
+					break
+				}
+			}
+			if checkedInAll {
+				result.AddCheck(check.ParamIndex, errInfo)
+			}
+		}
+	}
+
+	if len(result.Checks) == 0 {
+		return nil
+	}
+	return result
+}
+
+// containsErrorInfo checks if a slice of ErrorInfo contains the given error.
+func containsErrorInfo(infos []ErrorInfo, target ErrorInfo) bool {
+	key := target.Key()
+	for _, info := range infos {
+		if info.Key() == key {
+			return true
+		}
+	}
+	return false
+}

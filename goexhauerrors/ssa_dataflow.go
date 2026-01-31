@@ -202,31 +202,61 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
 		errs = append(errs, fnFact.Errors...)
 	}
 
+	// Also resolve errors through ParameterFlowFact for static calls
+	var flowFact *ParameterFlowFact
+	if localPF, ok := a.localParamFlowFacts[typesFunc]; ok {
+		flowFact = localPF
+	}
+	var importedPF ParameterFlowFact
+	if a.pass.ImportObjectFact(typesFunc, &importedPF) {
+		if flowFact == nil {
+			flowFact = &importedPF
+		}
+	}
+	if flowFact != nil {
+		paramFlowErrs := a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee)
+		errs = append(errs, paramFlowErrs...)
+	}
+
 	return errs
 }
 
 // getErrorsFromInvoke extracts error information from an interface method call.
-// It collects errors from all known implementations of the interface method.
+// It collects errors from all known implementations of the interface method,
+// and also resolves ParameterFlowFact to trace errors through parameters.
 func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 	ifaceMethod := call.Call.Method
 	if ifaceMethod == nil {
 		return nil
 	}
 
-	// First check if there's an InterfaceMethodFact for this method
+	var allErrors []ErrorInfo
+
+	// Check InterfaceMethodFact for this method
 	var ifaceFact InterfaceMethodFact
-	if a.pass.ImportObjectFact(ifaceMethod, &ifaceFact) {
-		return ifaceFact.Errors
+	hasIfaceFact := a.pass.ImportObjectFact(ifaceMethod, &ifaceFact)
+	if hasIfaceFact {
+		allErrors = append(allErrors, ifaceFact.Errors...)
 	}
 
-	// Get the interface type from the receiver
+	// Check ParameterFlowFact on the interface method (exported as intersection of impls)
+	var flowFact ParameterFlowFact
+	if a.pass.ImportObjectFact(ifaceMethod, &flowFact) {
+		paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, &flowFact)
+		allErrors = append(allErrors, paramFlowErrs...)
+	}
+
+	if hasIfaceFact {
+		return a.deduplicateErrors(allErrors)
+	}
+
+	// Fallback: Get the interface type and scan implementations
 	ifaceType := getInterfaceType(call.Call.Value.Type())
 	if ifaceType == nil {
-		return nil
+		return a.deduplicateErrors(allErrors)
 	}
 
 	// Find all implementations and collect their errors
-	var allErrors []ErrorInfo
 	implementingTypes := a.interfaceImpls.getImplementingTypes(ifaceType)
 	for _, concreteType := range implementingTypes {
 		method := findMethodImplementation(concreteType, ifaceMethod)
@@ -234,19 +264,103 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 			continue
 		}
 
-		// Get errors from this method's FunctionErrorsFact (local facts first)
+		// FunctionErrorsFact
 		if localFact, ok := a.localFacts[method]; ok {
 			allErrors = append(allErrors, localFact.Errors...)
 		}
-
-		// Also check imported facts
 		var fnFact FunctionErrorsFact
 		if a.pass.ImportObjectFact(method, &fnFact) {
 			allErrors = append(allErrors, fnFact.Errors...)
 		}
 	}
 
+	// If no ParameterFlowFact was found on the interface method, compute intersection from impls
+	if !a.pass.ImportObjectFact(ifaceMethod, &flowFact) && len(implementingTypes) > 0 {
+		var implFlowFacts []*ParameterFlowFact
+		for _, concreteType := range implementingTypes {
+			method := findMethodImplementation(concreteType, ifaceMethod)
+			if method == nil {
+				continue
+			}
+			var pf *ParameterFlowFact
+			if localPF, ok := a.localParamFlowFacts[method]; ok {
+				pf = localPF
+			}
+			var importedPF ParameterFlowFact
+			if a.pass.ImportObjectFact(method, &importedPF) {
+				if pf == nil {
+					pf = &importedPF
+				} else {
+					pf.Merge(&importedPF)
+				}
+			}
+			implFlowFacts = append(implFlowFacts, pf)
+		}
+		intersected := intersectParameterFlowFacts(implFlowFacts)
+		if intersected != nil {
+			paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, intersected)
+			allErrors = append(allErrors, paramFlowErrs...)
+		}
+	}
+
 	return a.deduplicateErrors(allErrors)
+}
+
+// resolveParameterFlowErrorsForInvoke resolves concrete errors passed as arguments
+// to an interface method call (invoke mode) based on ParameterFlowFact.
+// In invoke mode, call.Call.Args contains only method arguments (no receiver).
+func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFact *ParameterFlowFact) []ErrorInfo {
+	var errs []ErrorInfo
+	args := call.Call.Args
+
+	for _, flow := range flowFact.Flows {
+		argIdx := flow.ParamIndex
+		if argIdx >= len(args) {
+			continue
+		}
+
+		argErrs := a.traceValueToErrors(args[argIdx], make(map[ssa.Value]bool), 0)
+		for i := range argErrs {
+			if flow.Wrapped {
+				argErrs[i].Wrapped = true
+			}
+		}
+		errs = append(errs, argErrs...)
+	}
+
+	return errs
+}
+
+// resolveParameterFlowErrorsForStaticCall resolves concrete errors passed as arguments
+// to a static function/method call based on ParameterFlowFact.
+// For method calls, args[0] is the receiver, so ParamIndex must be offset by 1.
+func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowFact *ParameterFlowFact, callee *ssa.Function) []ErrorInfo {
+	var errs []ErrorInfo
+	args := call.Call.Args
+
+	// For methods, SSA args include the receiver at index 0
+	receiverOffset := 0
+	sig := callee.Signature
+	if sig.Recv() != nil {
+		receiverOffset = 1
+	}
+
+	for _, flow := range flowFact.Flows {
+		argIdx := flow.ParamIndex + receiverOffset
+		if argIdx >= len(args) {
+			continue
+		}
+
+		argErrs := a.traceValueToErrors(args[argIdx], make(map[ssa.Value]bool), 0)
+		for i := range argErrs {
+			if flow.Wrapped {
+				argErrs[i].Wrapped = true
+			}
+		}
+		errs = append(errs, argErrs...)
+	}
+
+	return errs
 }
 
 // getErrorsFromMakeInterface checks if a MakeInterface creates a known custom error type.
@@ -507,6 +621,13 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 		return nil
 	}
 
+	// For methods, SSA includes receiver at index 0, but call.Args doesn't
+	// We need to adjust the parameter index
+	receiverOffset := 0
+	if sig.Recv() != nil {
+		receiverOffset = 1
+	}
+
 	fact := &ParameterFlowFact{}
 
 	// For each return statement, trace which parameters reach it
@@ -521,7 +642,12 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 				if pos < len(ret.Results) {
 					flows := a.traceValueToParameters(ret.Results[pos], ssaFn.Params, make(map[ssa.Value]bool), 0)
 					for _, flow := range flows {
-						fact.AddFlow(flow)
+						// Adjust parameter index for methods (receiver is not in call.Args)
+						adjustedFlow := ParameterFlowInfo{
+							ParamIndex: flow.ParamIndex - receiverOffset,
+							Wrapped:    flow.Wrapped,
+						}
+						fact.AddFlow(adjustedFlow)
 					}
 				}
 			}
