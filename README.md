@@ -171,10 +171,10 @@ func UseClosure() {
 
 ### Required Checks
 
-Use `errors.Is` or `errors.As` to check errors:
+Use `errors.Is`, `errors.As`, direct comparison (`==`/`!=`), or type switch to check errors:
 
 ```go
-// if-else chain
+// if-else chain with errors.Is
 func GoodCaller() {
     _, err := GetItem("test")
     if errors.Is(err, ErrNotFound) {
@@ -184,7 +184,7 @@ func GoodCaller() {
     }
 }
 
-// switch statement
+// switch statement with errors.Is
 func SwitchCaller() {
     _, err := GetItem("test")
     switch {
@@ -195,13 +195,92 @@ func SwitchCaller() {
     }
 }
 
-// custom error types
+// direct comparison (== / !=)
+func DirectCompareCaller() {
+    _, err := GetItem("test")
+    if err == ErrNotFound {
+        println("not found")
+    } else if err == ErrPermission {
+        println("permission denied")
+    }
+}
+
+// switch with error tag
+func SwitchTagCaller() {
+    _, err := GetItem("test")
+    switch err {
+    case ErrNotFound:
+        println("not found")
+    case ErrPermission:
+        println("permission denied")
+    }
+}
+
+// custom error types with errors.As
 func CheckCustomType() {
     err := Validate("")
     var validationErr *ValidationError
     if errors.As(err, &validationErr) {
         println("validation error on field:", validationErr.Field)
     }
+}
+
+// type switch
+func TypeSwitchCaller() {
+    err := Validate("")
+    switch err.(type) {
+    case *ValidationError:
+        println("validation error")
+    }
+}
+```
+
+### Checks Inside defer and select
+
+Error checks inside `defer` statements and `select` case bodies are recognized:
+
+```go
+func DeferCaller() {
+    _, err := GetItem("test")
+    defer func() {
+        if errors.Is(err, ErrNotFound) {
+            println("not found")
+        }
+        if errors.Is(err, ErrPermission) {
+            println("permission")
+        }
+    }()
+}
+
+func SelectCaller() {
+    _, err := GetItem("test")
+    ch := make(chan struct{})
+    select {
+    case <-ch:
+        if errors.Is(err, ErrNotFound) {
+            println("not found")
+        }
+        if errors.Is(err, ErrPermission) {
+            println("permission")
+        }
+    }
+}
+```
+
+### Function Literals
+
+Error handling inside anonymous functions, immediately-invoked function literals, and goroutine closures is analyzed:
+
+```go
+func FuncLitCaller() {
+    fn := func() {
+        _, err := GetItem("test")
+        // Warning: missing errors.Is check for ErrNotFound, ErrPermission
+        if err != nil {
+            println(err.Error())
+        }
+    }
+    fn()
 }
 ```
 
@@ -382,14 +461,16 @@ func ReassignExample() {
 
 The following patterns are NOT detected:
 
-### Unexported Errors
+### Unexported Errors (Cross-Package)
 
-Unexported errors (lowercase names) are intentionally excluded:
+Unexported errors are tracked within the same package but are not exported as facts for cross-package analysis:
 
 ```go
-var errInternal = errors.New("internal")  // Not tracked (unexported)
-var ErrPublic = errors.New("public")      // Tracked (exported)
+var errInternal = errors.New("internal")  // Tracked within the same package
+var ErrPublic = errors.New("public")      // Tracked and exported for cross-package analysis
 ```
+
+Callers in the same package will be warned about unchecked unexported errors. Callers in other packages will only see exported errors.
 
 ### Struct/Map Field Storage
 
@@ -445,6 +526,7 @@ func CreateError(msg string) error {
 |----------|---------|----------|
 | Definition | Sentinel vars (`var Err* = errors.New`) | Yes |
 | | Custom error types | Yes |
+| | Unexported errors (same package) | Yes |
 | Tracking | Direct returns | Yes |
 | | Wrapped errors (%w) | Yes |
 | | Variable propagation (SSA-based) | Yes |
@@ -452,13 +534,20 @@ func CreateError(msg string) error {
 | | Conditional branches (Phi nodes) | Yes |
 | | Factory functions | Yes |
 | | Closures | Yes |
+| | Function literals | Yes |
 | | Variable reassignment | Yes |
 | | Concrete type methods | Yes |
 | | Function parameters | Yes |
 | | Error checks inside called functions | Yes |
 | | Interface method calls | Yes |
 | | Higher-order functions (lambda) | Yes |
-| Not Supported | Unexported errors | No (by design) |
+| Check Patterns | `errors.Is` / `errors.As` | Yes |
+| | Direct comparison (`==` / `!=`) | Yes |
+| | Type switch (`switch err.(type)`) | Yes |
+| | Switch with error tag (`switch err`) | Yes |
+| | Inside `defer` statements | Yes |
+| | Inside `select` case bodies | Yes |
+| Not Supported | Unexported errors (cross-package) | No (by design) |
 | | Struct/map field storage | No |
 | | Ignored packages | No (use -ignorePackages flag) |
 | | Dynamic error creation | No |

@@ -64,21 +64,18 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 					continue
 				}
 
-				// Skip unexported errors
-				if !token.IsExported(name.Name) {
-					continue
-				}
-
 				// Check initialization pattern
 				if i < len(valueSpec.Values) {
 					if isSentinelInit(pass, valueSpec.Values[i]) {
 						result.vars[varObj] = true
-						// Export fact for cross-package analysis
-						fact := &ErrorFact{
-							Name:    name.Name,
-							PkgPath: pass.Pkg.Path(),
+						// Only export fact for exported errors (cross-package analysis)
+						if token.IsExported(name.Name) {
+							fact := &ErrorFact{
+								Name:    name.Name,
+								PkgPath: pass.Pkg.Path(),
+							}
+							pass.ExportObjectFact(varObj, fact)
 						}
-						pass.ExportObjectFact(varObj, fact)
 					}
 				}
 			}
@@ -98,11 +95,6 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 			continue
 		}
 
-		// Skip unexported types
-		if !token.IsExported(name) {
-			continue
-		}
-
 		// Check if this type implements error interface
 		namedType, ok := typeName.Type().(*types.Named)
 		if !ok {
@@ -118,12 +110,14 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 			}
 
 			result.types[typeName] = true
-			// Export fact for cross-package analysis
-			fact := &ErrorFact{
-				Name:    typeName.Name(),
-				PkgPath: pass.Pkg.Path(),
+			// Only export fact for exported types (cross-package analysis)
+			if token.IsExported(name) {
+				fact := &ErrorFact{
+					Name:    typeName.Name(),
+					PkgPath: pass.Pkg.Path(),
+				}
+				pass.ExportObjectFact(typeName, fact)
 			}
-			pass.ExportObjectFact(typeName, fact)
 		}
 	}
 }

@@ -16,19 +16,40 @@ func checkCallSites(pass *analysis.Pass) {
 
 	nodeFilter := []ast.Node{
 		(*ast.FuncDecl)(nil),
+		(*ast.FuncLit)(nil),
 	}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
-		funcDecl := n.(*ast.FuncDecl)
-		if funcDecl.Body == nil {
-			return
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			if node.Body == nil {
+				return
+			}
+			returnsError := funcReturnsError(pass, node)
+			checkFunctionBody(pass, node.Body, returnsError)
+
+		case *ast.FuncLit:
+			if node.Body == nil {
+				return
+			}
+			tv := pass.TypesInfo.Types[node]
+			if !tv.IsValue() {
+				return
+			}
+			sig, ok := tv.Type.(*types.Signature)
+			if !ok {
+				return
+			}
+			returnsError := false
+			results := sig.Results()
+			for i := 0; i < results.Len(); i++ {
+				if isErrorType(results.At(i).Type()) {
+					returnsError = true
+					break
+				}
+			}
+			checkFunctionBody(pass, node.Body, returnsError)
 		}
-
-		// Check if this function returns error (for propagation detection)
-		returnsError := funcReturnsError(pass, funcDecl)
-
-		// Find all call expressions and their error assignments
-		checkFunctionBody(pass, funcDecl.Body, returnsError)
 	})
 }
 
@@ -152,7 +173,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			}
 		}
 
-		// Merge states: mark errors as checked if checked in BOTH branches
+		// Merge states back
 		mergeStates(states, ifStates, elseStates)
 
 	case *ast.SwitchStmt:
@@ -162,6 +183,20 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 		if s.Tag != nil {
 			collectErrorsIsInExpr(pass, s.Tag, states)
 		}
+
+		// Find tracked error variable used as switch tag (for `switch err { case ErrX: }`)
+		var switchTagVar *types.Var
+		if s.Tag != nil {
+			if ident, ok := s.Tag.(*ast.Ident); ok {
+				obj := pass.TypesInfo.Uses[ident]
+				if v, ok := obj.(*types.Var); ok {
+					if _, tracked := states[v]; tracked {
+						switchTagVar = v
+					}
+				}
+			}
+		}
+
 		// Process switch body
 		if s.Body != nil {
 			for _, clause := range s.Body.List {
@@ -170,10 +205,84 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 					for _, expr := range cc.List {
 						collectErrorsIsInExpr(pass, expr, states)
 					}
+					// Check case values as direct comparisons against switch tag
+					if switchTagVar != nil {
+						if state, ok := states[switchTagVar]; ok {
+							for _, expr := range cc.List {
+								errorKey := extractErrorKey(pass, expr)
+								if errorKey != "" {
+									state.checked[errorKey] = true
+								}
+							}
+						}
+					}
 					// Walk case body
 					caseStates := cloneStates(states)
 					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
 					// Merge back checked errors
+					for varObj, caseState := range caseStates {
+						if state, ok := states[varObj]; ok {
+							for key := range caseState.checked {
+								state.checked[key] = true
+							}
+						}
+					}
+				}
+			}
+		}
+
+	case *ast.TypeSwitchStmt:
+		if s.Init != nil {
+			walkStatementWithScope(pass, s.Init, states, canPropagate)
+		}
+
+		// Find the error variable being type-switched
+		var switchVar *types.Var
+		if s.Assign != nil {
+			switch assign := s.Assign.(type) {
+			case *ast.ExprStmt:
+				// switch err.(type) { ... }
+				if ta, ok := assign.X.(*ast.TypeAssertExpr); ok {
+					if ident, ok := ta.X.(*ast.Ident); ok {
+						obj := pass.TypesInfo.Uses[ident]
+						if v, ok := obj.(*types.Var); ok {
+							switchVar = v
+						}
+					}
+				}
+			case *ast.AssignStmt:
+				// switch v := err.(type) { ... }
+				if len(assign.Rhs) == 1 {
+					if ta, ok := assign.Rhs[0].(*ast.TypeAssertExpr); ok {
+						if ident, ok := ta.X.(*ast.Ident); ok {
+							obj := pass.TypesInfo.Uses[ident]
+							if v, ok := obj.(*types.Var); ok {
+								switchVar = v
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if s.Body != nil {
+			for _, clause := range s.Body.List {
+				if cc, ok := clause.(*ast.CaseClause); ok {
+					// Check if any case type matches a tracked error type
+					if switchVar != nil {
+						if state, ok := states[switchVar]; ok {
+							for _, caseExpr := range cc.List {
+								typeName := extractTypeNameFromExpr(pass, caseExpr)
+								if typeName != "" {
+									state.checked[typeName] = true
+								}
+							}
+						}
+					}
+
+					// Walk case body
+					caseStates := cloneStates(states)
+					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
 							for key := range caseState.checked {
@@ -225,6 +334,28 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			walkStatementsWithScope(pass, s.Body.List, states, canPropagate)
 		}
 
+	case *ast.DeferStmt:
+		// Check the deferred call expression for errors.Is/As
+		collectErrorsIsInExpr(pass, s.Call, states)
+
+	case *ast.SelectStmt:
+		if s.Body != nil {
+			for _, clause := range s.Body.List {
+				if cc, ok := clause.(*ast.CommClause); ok {
+					caseStates := cloneStates(states)
+					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
+					// Merge back checked errors
+					for varObj, caseState := range caseStates {
+						if state, ok := states[varObj]; ok {
+							for key := range caseState.checked {
+								state.checked[key] = true
+							}
+						}
+					}
+				}
+			}
+		}
+
 	case *ast.DeclStmt:
 		if genDecl, ok := s.Decl.(*ast.GenDecl); ok {
 			for _, spec := range genDecl.Specs {
@@ -259,43 +390,61 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 	}
 }
 
-// collectErrorsIsInExpr finds errors.Is/As calls in an expression and marks errors as checked.
+// collectErrorsIsInExpr finds errors.Is/As calls and direct comparisons in an expression and marks errors as checked.
 func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types.Var]*errorVarState) {
 	ast.Inspect(expr, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-
-		if isErrorsIsCall(pass, call) {
-			if len(call.Args) >= 2 {
-				// Find which error variable is being checked
-				for varObj, state := range states {
-					if referencesVariable(pass, call.Args[0], varObj) {
-						errorKey := extractErrorKey(pass, call.Args[1])
-						if errorKey != "" {
-							state.checked[errorKey] = true
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			if isErrorsIsCall(pass, node) {
+				if len(node.Args) >= 2 {
+					// Find which error variable is being checked
+					for varObj, state := range states {
+						if referencesVariable(pass, node.Args[0], varObj) {
+							errorKey := extractErrorKey(pass, node.Args[1])
+							if errorKey != "" {
+								state.checked[errorKey] = true
+							}
 						}
 					}
 				}
 			}
-		}
 
-		if isErrorsAsCall(pass, call) {
-			if len(call.Args) >= 2 {
-				for varObj, state := range states {
-					if referencesVariable(pass, call.Args[0], varObj) {
-						errorKey := extractErrorKeyFromAsTarget(pass, call.Args[1])
-						if errorKey != "" {
-							state.checked[errorKey] = true
+			if isErrorsAsCall(pass, node) {
+				if len(node.Args) >= 2 {
+					for varObj, state := range states {
+						if referencesVariable(pass, node.Args[0], varObj) {
+							errorKey := extractErrorKeyFromAsTarget(pass, node.Args[1])
+							if errorKey != "" {
+								state.checked[errorKey] = true
+							}
 						}
 					}
 				}
+			}
+
+		case *ast.BinaryExpr:
+			if node.Op == token.EQL || node.Op == token.NEQ {
+				// Try both directions: err == ErrX or ErrX == err
+				tryMarkDirectComparison(pass, node.X, node.Y, states)
+				tryMarkDirectComparison(pass, node.Y, node.X, states)
 			}
 		}
 
 		return true
 	})
+}
+
+// tryMarkDirectComparison checks if lhs is a tracked error variable and rhs is a known error,
+// and marks the error as checked if so.
+func tryMarkDirectComparison(pass *analysis.Pass, lhs, rhs ast.Expr, states map[*types.Var]*errorVarState) {
+	for varObj, state := range states {
+		if referencesVariable(pass, lhs, varObj) {
+			errorKey := extractErrorKey(pass, rhs)
+			if errorKey != "" {
+				state.checked[errorKey] = true
+			}
+		}
+	}
 }
 
 // isVariablePropagatedInReturn checks if a variable's errors are propagated
@@ -499,13 +648,15 @@ func cloneStates(states map[*types.Var]*errorVarState) map[*types.Var]*errorVarS
 }
 
 // mergeStates merges branch states back into the main states.
-// A error is considered checked if it's checked in EITHER branch (conservative approach).
+// An error is considered checked if it's checked in EITHER branch (OR merge).
+// This is the pragmatic choice for Go's control flow model where early returns
+// (if err != nil { return err }) mean only one branch continues after the if.
+// AND merge would be theoretically more precise but breaks idiomatic Go patterns.
 func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[*types.Var]*errorVarState) {
 	for varObj, state := range states {
 		ifState := ifStates[varObj]
 		elseState := elseStates[varObj]
 
-		// A error is checked if checked in either branch
 		for _, errInfo := range state.errors {
 			key := errInfo.Key()
 			checkedInIf := ifState != nil && ifState.checked[key]
@@ -1019,6 +1170,38 @@ func referencesVariable(pass *analysis.Pass, expr ast.Expr, targetVar *types.Var
 		return true
 	})
 	return found
+}
+
+// extractTypeNameFromExpr extracts the error key from a type expression in a type switch case.
+// Handles: *SomeError, SomeError, *pkg.SomeError, pkg.SomeError
+func extractTypeNameFromExpr(pass *analysis.Pass, expr ast.Expr) string {
+	// Handle pointer types: *SomeError
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+
+	tv := pass.TypesInfo.Types[expr]
+	if !tv.IsType() {
+		return ""
+	}
+
+	t := tv.Type
+	// Unwrap pointer if still present
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+
+	if named, ok := t.(*types.Named); ok {
+		typeName := named.Obj()
+		var errorFact ErrorFact
+		if pass.ImportObjectFact(typeName, &errorFact) {
+			return errorFact.PkgPath + "." + errorFact.Name
+		}
+		if typeName.Pkg() != nil {
+			return typeName.Pkg().Path() + "." + typeName.Name()
+		}
+	}
+	return ""
 }
 
 // extractErrorKey extracts the error key from an errors.Is second argument.
