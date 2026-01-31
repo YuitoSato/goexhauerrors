@@ -127,14 +127,6 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 
 			errorVar := findErrorVarInAssignmentWithSig(pass, s, i, sig)
 			if errorVar == nil {
-				// Check if error was assigned to blank identifier
-				if isErrorAssignedToBlank(s, i, sig) {
-					for _, errInfo := range fnFact.Errors {
-						if !shouldIgnorePackage(errInfo.PkgPath) {
-							pass.Reportf(call.Pos(), "error assigned to blank identifier, missing check for %s", errInfo.Key())
-						}
-					}
-				}
 				continue
 			}
 
@@ -154,18 +146,6 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 	case *ast.ExprStmt:
 		// Check for errors.Is calls in expression statements
 		collectErrorsIsInExpr(pass, s.X, states)
-
-		// Check for function calls whose error return value is completely ignored
-		if call, ok := s.X.(*ast.CallExpr); ok {
-			fnFact, _ := getCallErrors(pass, call)
-			if fnFact != nil && len(fnFact.Errors) > 0 {
-				for _, errInfo := range fnFact.Errors {
-					if !shouldIgnorePackage(errInfo.PkgPath) {
-						pass.Reportf(call.Pos(), "error return value is discarded, missing check for %s", errInfo.Key())
-					}
-				}
-			}
-		}
 
 	case *ast.IfStmt:
 		// Check condition for errors.Is
@@ -1090,29 +1070,6 @@ func findErrorVarInAssignmentWithSig(pass *analysis.Pass, stmt *ast.AssignStmt, 
 	}
 
 	return nil
-}
-
-// isErrorAssignedToBlank checks if the error return value is assigned to the blank identifier `_`.
-func isErrorAssignedToBlank(stmt *ast.AssignStmt, rhsIndex int, sig *types.Signature) bool {
-	results := sig.Results()
-	if len(stmt.Rhs) == 1 && results.Len() > 1 {
-		// Multiple returns: _, _ = someFunc()
-		for i := 0; i < results.Len(); i++ {
-			if isErrorType(results.At(i).Type()) && i < len(stmt.Lhs) {
-				if ident, ok := stmt.Lhs[i].(*ast.Ident); ok && ident.Name == "_" {
-					return true
-				}
-			}
-		}
-	} else {
-		// Single return: _ = someFunc()
-		if rhsIndex < len(stmt.Lhs) {
-			if ident, ok := stmt.Lhs[rhsIndex].(*ast.Ident); ok && ident.Name == "_" {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // isErrorsIsCall checks if the call is errors.Is().
