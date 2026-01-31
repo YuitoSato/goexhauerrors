@@ -85,8 +85,6 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 
 // detectCustomErrorTypes finds struct types that implement the error interface.
 func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
-	errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
-
 	scope := pass.Pkg.Scope()
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
@@ -122,6 +120,9 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 	}
 }
 
+// errorInterface is the pre-computed error interface type for fast comparison.
+var errorInterface = types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+
 // isErrorType checks if the given type is the error interface.
 func isErrorType(t types.Type) bool {
 	// Check if it's exactly the error interface
@@ -132,7 +133,6 @@ func isErrorType(t types.Type) bool {
 	}
 	// Check if it's an interface that matches error
 	if iface, ok := t.Underlying().(*types.Interface); ok {
-		errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
 		return types.Identical(iface, errorInterface)
 	}
 	return false

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 )
@@ -67,12 +68,17 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 	localParamFlowFacts := make(map[*types.Func]*ParameterFlowFact)
 	localCallFlowFacts := make(map[*types.Func]*FunctionParamCallFlowFact)
 
+	// Build SSA function lookup map once (reused across iterations)
+	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	ssaFuncMap := buildSSAFuncMap(ssaResult)
+
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
-	for {
+	const maxIterations = 10
+	for iteration := 0; iteration < maxIterations; iteration++ {
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
+		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls, ssaFuncMap)
 
 		for _, fi := range funcs {
 			// Phase A: Detect parameter flow (for error-typed parameters)

@@ -10,8 +10,19 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 )
 
+// callSiteAnalyzer holds context for call site analysis to avoid recomputing expensive data.
+type callSiteAnalyzer struct {
+	pass           *analysis.Pass
+	interfaceImpls *interfaceImplementations
+}
+
 // checkCallSites checks all call sites to ensure errors are properly checked.
-func checkCallSites(pass *analysis.Pass) {
+func checkCallSites(pass *analysis.Pass, interfaceImpls *interfaceImplementations) {
+	csa := &callSiteAnalyzer{
+		pass:           pass,
+		interfaceImpls: interfaceImpls,
+	}
+
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
@@ -26,7 +37,7 @@ func checkCallSites(pass *analysis.Pass) {
 				return
 			}
 			returnsError := funcReturnsError(pass, node)
-			checkFunctionBody(pass, node.Body, returnsError)
+			csa.checkFunctionBody(node.Body, returnsError)
 
 		case *ast.FuncLit:
 			if node.Body == nil {
@@ -48,7 +59,7 @@ func checkCallSites(pass *analysis.Pass) {
 					break
 				}
 			}
-			checkFunctionBody(pass, node.Body, returnsError)
+			csa.checkFunctionBody(node.Body, returnsError)
 		}
 	})
 }
@@ -81,28 +92,29 @@ type errorVarState struct {
 }
 
 // checkFunctionBody checks all call sites within a function body using flow-sensitive analysis.
-func checkFunctionBody(pass *analysis.Pass, body *ast.BlockStmt, canPropagate bool) {
+func (csa *callSiteAnalyzer) checkFunctionBody(body *ast.BlockStmt, canPropagate bool) {
 	// Track active error states for each variable
 	states := make(map[*types.Var]*errorVarState)
 
 	// Walk statements in order for flow-sensitive analysis
-	walkStatementsWithScope(pass, body.List, states, canPropagate)
+	csa.walkStatementsWithScope(body.List, states, canPropagate)
 
 	// Report any remaining unchecked errors at end of function
 	for _, state := range states {
-		reportUncheckedErrors(pass, state)
+		reportUncheckedErrors(csa.pass, state)
 	}
 }
 
 // walkStatementsWithScope walks statements and tracks error variable states.
-func walkStatementsWithScope(pass *analysis.Pass, stmts []ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
+func (csa *callSiteAnalyzer) walkStatementsWithScope(stmts []ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
 	for _, stmt := range stmts {
-		walkStatementWithScope(pass, stmt, states, canPropagate)
+		csa.walkStatementWithScope(stmt, states, canPropagate)
 	}
 }
 
 // walkStatementWithScope processes a single statement for error tracking.
-func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
+func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
+	pass := csa.pass
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		// First, check for errors.Is in RHS expressions (before assignment)
@@ -118,9 +130,9 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			}
 
 			// Mark tracked error variables as transferred when passed to functions with ParameterFlowFact
-			markTransferredErrorArgs(pass, call, states)
+			csa.markTransferredErrorArgs(call, states)
 
-			fnFact, sig := getCallErrors(pass, call)
+			fnFact, sig := csa.getCallErrors(call)
 			if fnFact == nil || len(fnFact.Errors) == 0 {
 				continue
 			}
@@ -153,7 +165,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 
 		// Process init statement if present
 		if s.Init != nil {
-			walkStatementWithScope(pass, s.Init, states, canPropagate)
+			csa.walkStatementWithScope(s.Init, states, canPropagate)
 		}
 
 		// Clone states for branches
@@ -161,15 +173,15 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 		elseStates := cloneStates(states)
 
 		// Process if body
-		walkStatementsWithScope(pass, s.Body.List, ifStates, canPropagate)
+		csa.walkStatementsWithScope(s.Body.List, ifStates, canPropagate)
 
 		// Process else body if present
 		if s.Else != nil {
 			switch elseStmt := s.Else.(type) {
 			case *ast.BlockStmt:
-				walkStatementsWithScope(pass, elseStmt.List, elseStates, canPropagate)
+				csa.walkStatementsWithScope(elseStmt.List, elseStates, canPropagate)
 			case *ast.IfStmt:
-				walkStatementWithScope(pass, elseStmt, elseStates, canPropagate)
+				csa.walkStatementWithScope(elseStmt, elseStates, canPropagate)
 			}
 		}
 
@@ -178,7 +190,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 
 	case *ast.SwitchStmt:
 		if s.Init != nil {
-			walkStatementWithScope(pass, s.Init, states, canPropagate)
+			csa.walkStatementWithScope(s.Init, states, canPropagate)
 		}
 		if s.Tag != nil {
 			collectErrorsIsInExpr(pass, s.Tag, states)
@@ -218,7 +230,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 					}
 					// Walk case body
 					caseStates := cloneStates(states)
-					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
+					csa.walkStatementsWithScope(cc.Body, caseStates, canPropagate)
 					// Merge back checked errors
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
@@ -233,7 +245,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 
 	case *ast.TypeSwitchStmt:
 		if s.Init != nil {
-			walkStatementWithScope(pass, s.Init, states, canPropagate)
+			csa.walkStatementWithScope(s.Init, states, canPropagate)
 		}
 
 		// Find the error variable being type-switched
@@ -282,7 +294,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 
 					// Walk case body
 					caseStates := cloneStates(states)
-					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
+					csa.walkStatementsWithScope(cc.Body, caseStates, canPropagate)
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
 							for key := range caseState.checked {
@@ -298,7 +310,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 		// Check if error variables are propagated
 		for varObj, state := range states {
 			for _, result := range s.Results {
-				if isVariablePropagatedInReturn(pass, result, varObj) {
+				if csa.isVariablePropagatedInReturn(result, varObj) {
 					if canPropagate {
 						// Mark all errors as "checked" since we're propagating
 						for _, errInfo := range state.errors {
@@ -307,31 +319,31 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 					}
 				} else {
 					// Not fully propagated - check for partial checks via ParameterCheckedErrorsFact
-					markCheckedErrorsFromCall(pass, result, varObj, state)
+					csa.markCheckedErrorsFromCall(result, varObj, state)
 				}
 			}
 		}
 
 	case *ast.BlockStmt:
-		walkStatementsWithScope(pass, s.List, states, canPropagate)
+		csa.walkStatementsWithScope(s.List, states, canPropagate)
 
 	case *ast.ForStmt:
 		if s.Init != nil {
-			walkStatementWithScope(pass, s.Init, states, canPropagate)
+			csa.walkStatementWithScope(s.Init, states, canPropagate)
 		}
 		if s.Cond != nil {
 			collectErrorsIsInExpr(pass, s.Cond, states)
 		}
 		if s.Post != nil {
-			walkStatementWithScope(pass, s.Post, states, canPropagate)
+			csa.walkStatementWithScope(s.Post, states, canPropagate)
 		}
 		if s.Body != nil {
-			walkStatementsWithScope(pass, s.Body.List, states, canPropagate)
+			csa.walkStatementsWithScope(s.Body.List, states, canPropagate)
 		}
 
 	case *ast.RangeStmt:
 		if s.Body != nil {
-			walkStatementsWithScope(pass, s.Body.List, states, canPropagate)
+			csa.walkStatementsWithScope(s.Body.List, states, canPropagate)
 		}
 
 	case *ast.DeferStmt:
@@ -343,7 +355,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 			for _, clause := range s.Body.List {
 				if cc, ok := clause.(*ast.CommClause); ok {
 					caseStates := cloneStates(states)
-					walkStatementsWithScope(pass, cc.Body, caseStates, canPropagate)
+					csa.walkStatementsWithScope(cc.Body, caseStates, canPropagate)
 					// Merge back checked errors
 					for varObj, caseState := range caseStates {
 						if state, ok := states[varObj]; ok {
@@ -366,7 +378,7 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 							continue
 						}
 
-						fnFact, _ := getCallErrors(pass, call)
+						fnFact, _ := csa.getCallErrors(call)
 						if fnFact == nil || len(fnFact.Errors) == 0 {
 							continue
 						}
@@ -453,7 +465,8 @@ func tryMarkDirectComparison(pass *analysis.Pass, lhs, rhs ast.Expr, states map[
 // - Function call with ParameterFlowFact (return WrapError(err)) → propagation
 // - fmt.Errorf with %w (return fmt.Errorf("...: %w", err)) → propagation
 // - Function call without ParameterFlowFact (return ConsumeError(err)) → NOT propagation
-func isVariablePropagatedInReturn(pass *analysis.Pass, result ast.Expr, targetVar *types.Var) bool {
+func (csa *callSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targetVar *types.Var) bool {
+	pass := csa.pass
 	switch expr := result.(type) {
 	case *ast.Ident:
 		// Direct return: return err
@@ -482,7 +495,7 @@ func isVariablePropagatedInReturn(pass *analysis.Pass, result ast.Expr, targetVa
 			}
 			// Fallback for cross-package interface methods
 			if sel, ok := expr.Fun.(*ast.SelectorExpr); ok {
-				if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+				if ifaceFlowFact := csa.getInterfaceMethodParameterFlow(sel); ifaceFlowFact != nil {
 					return ifaceFlowFact.HasFlowForParam(argIndex)
 				}
 			}
@@ -543,7 +556,8 @@ func isFmtErrorfWrappingVariable(pass *analysis.Pass, call *ast.CallExpr, target
 // passed to a function that has ParameterFlowFact or ParameterCheckedErrorsFact.
 // - ParameterFlowFact: marks ALL errors as transferred (full propagation)
 // - ParameterCheckedErrorsFact: marks only the checked errors (partial check)
-func markTransferredErrorArgs(pass *analysis.Pass, call *ast.CallExpr, states map[*types.Var]*errorVarState) {
+func (csa *callSiteAnalyzer) markTransferredErrorArgs(call *ast.CallExpr, states map[*types.Var]*errorVarState) {
+	pass := csa.pass
 	calledFn := getCalledFunction(pass, call)
 	if calledFn == nil {
 		return
@@ -559,13 +573,13 @@ func markTransferredErrorArgs(pass *analysis.Pass, call *ast.CallExpr, states ma
 	if !hasFlowFact || !hasCheckedFact {
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 			if !hasFlowFact {
-				if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+				if ifaceFlowFact := csa.getInterfaceMethodParameterFlow(sel); ifaceFlowFact != nil {
 					flowFact = *ifaceFlowFact
 					hasFlowFact = true
 				}
 			}
 			if !hasCheckedFact {
-				if ifaceCheckedFact := getInterfaceMethodCheckedErrors(pass, sel); ifaceCheckedFact != nil {
+				if ifaceCheckedFact := csa.getInterfaceMethodCheckedErrors(sel); ifaceCheckedFact != nil {
 					checkedFact = *ifaceCheckedFact
 					hasCheckedFact = true
 				}
@@ -605,7 +619,8 @@ func markTransferredErrorArgs(pass *analysis.Pass, call *ast.CallExpr, states ma
 
 // markCheckedErrorsFromCall checks if a return expression is a function call
 // with ParameterCheckedErrorsFact and marks the checked errors on the variable's state.
-func markCheckedErrorsFromCall(pass *analysis.Pass, result ast.Expr, targetVar *types.Var, state *errorVarState) {
+func (csa *callSiteAnalyzer) markCheckedErrorsFromCall(result ast.Expr, targetVar *types.Var, state *errorVarState) {
+	pass := csa.pass
 	call, ok := result.(*ast.CallExpr)
 	if !ok {
 		return
@@ -626,7 +641,7 @@ func markCheckedErrorsFromCall(pass *analysis.Pass, result ast.Expr, targetVar *
 		markPartialCheckedErrors(state, &checkedFact, argIndex)
 	} else if sel, ok := result.(*ast.CallExpr).Fun.(*ast.SelectorExpr); ok {
 		// Fallback for cross-package interface methods
-		if ifaceCheckedFact := getInterfaceMethodCheckedErrors(pass, sel); ifaceCheckedFact != nil {
+		if ifaceCheckedFact := csa.getInterfaceMethodCheckedErrors(sel); ifaceCheckedFact != nil {
 			markPartialCheckedErrors(state, ifaceCheckedFact, argIndex)
 		}
 	}
@@ -700,7 +715,8 @@ func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[
 // getCallErrors returns the FunctionErrorsFact and signature for a call expression.
 // It handles both regular function calls and closure variable calls.
 // It also resolves errors through ParameterFlowFact.
-func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact, *types.Signature) {
+func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsFact, *types.Signature) {
+	pass := csa.pass
 	// First, try to get it as a regular function
 	calledFn := getCalledFunction(pass, call)
 	if calledFn != nil {
@@ -731,7 +747,7 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 		} else if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 			// Fallback for cross-package interface methods: dynamically compute
 			// intersection of ParameterFlowFact from implementations
-			if ifaceFlowFact := getInterfaceMethodParameterFlow(pass, sel); ifaceFlowFact != nil {
+			if ifaceFlowFact := csa.getInterfaceMethodParameterFlow(sel); ifaceFlowFact != nil {
 				paramFlowErrors := resolveParameterFlowErrorsAST(pass, call, ifaceFlowFact)
 				for _, err := range paramFlowErrors {
 					result.AddError(err)
@@ -754,7 +770,7 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 
 		// If no facts found yet, check if this is an interface method and look for implementations
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-			if fact, _ := getInterfaceMethodErrors(pass, sel); fact != nil && len(fact.Errors) > 0 {
+			if fact, _ := csa.getInterfaceMethodErrors(sel); fact != nil && len(fact.Errors) > 0 {
 				return fact, sig
 			}
 		}
@@ -764,7 +780,7 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 
 	// Check for interface method call (selector expression on interface type)
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-		if fact, sig := getInterfaceMethodErrors(pass, sel); fact != nil {
+		if fact, sig := csa.getInterfaceMethodErrors(sel); fact != nil {
 			return fact, sig
 		}
 	}
@@ -797,7 +813,8 @@ func getCallErrors(pass *analysis.Pass, call *ast.CallExpr) (*FunctionErrorsFact
 
 // getInterfaceMethodErrors returns errors from an interface method call.
 // It checks if the receiver is an interface type and returns the InterfaceMethodFact.
-func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*FunctionErrorsFact, *types.Signature) {
+func (csa *callSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*FunctionErrorsFact, *types.Signature) {
+	pass := csa.pass
 	// Check if the receiver is an interface type
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
@@ -830,8 +847,7 @@ func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*Func
 
 	// If no fact found, try to find implementations in the current package
 	// This handles the case where the interface and implementations are in the same package
-	impls := findInterfaceImplementations(pass)
-	implementingTypes := impls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
 
 	result := &FunctionErrorsFact{}
 	for _, concreteType := range implementingTypes {
@@ -856,7 +872,8 @@ func getInterfaceMethodErrors(pass *analysis.Pass, sel *ast.SelectorExpr) (*Func
 // getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
 // from all implementations of an interface method.
 // Returns nil if the receiver is not an interface type or no implementations have flow facts.
-func getInterfaceMethodParameterFlow(pass *analysis.Pass, sel *ast.SelectorExpr) *ParameterFlowFact {
+func (csa *callSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorExpr) *ParameterFlowFact {
+	pass := csa.pass
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
 		return nil
@@ -880,8 +897,7 @@ func getInterfaceMethodParameterFlow(pass *analysis.Pass, sel *ast.SelectorExpr)
 	}
 
 	// Dynamically compute intersection from implementations
-	impls := findInterfaceImplementations(pass)
-	implementingTypes := impls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
 	if len(implementingTypes) == 0 {
 		return nil
 	}
@@ -906,7 +922,8 @@ func getInterfaceMethodParameterFlow(pass *analysis.Pass, sel *ast.SelectorExpr)
 // getInterfaceMethodCheckedErrors returns the intersection of ParameterCheckedErrorsFact
 // from all implementations of an interface method.
 // Returns nil if the receiver is not an interface type or no implementations have checked facts.
-func getInterfaceMethodCheckedErrors(pass *analysis.Pass, sel *ast.SelectorExpr) *ParameterCheckedErrorsFact {
+func (csa *callSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorExpr) *ParameterCheckedErrorsFact {
+	pass := csa.pass
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
 		return nil
@@ -930,8 +947,7 @@ func getInterfaceMethodCheckedErrors(pass *analysis.Pass, sel *ast.SelectorExpr)
 	}
 
 	// Dynamically compute intersection from implementations
-	impls := findInterfaceImplementations(pass)
-	implementingTypes := impls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
 	if len(implementingTypes) == 0 {
 		return nil
 	}

@@ -17,10 +17,24 @@ type ssaAnalyzer struct {
 	localFacts          map[*types.Func]*FunctionErrorsFact
 	localParamFlowFacts map[*types.Func]*ParameterFlowFact
 	interfaceImpls      *interfaceImplementations
+	ssaFuncMap          map[*types.Func]*ssa.Function
+}
+
+// buildSSAFuncMap builds a lookup map from types.Func to ssa.Function for O(1) lookups.
+func buildSSAFuncMap(ssaResult *buildssa.SSA) map[*types.Func]*ssa.Function {
+	ssaFuncMap := make(map[*types.Func]*ssa.Function, len(ssaResult.SrcFuncs))
+	for _, ssaFn := range ssaResult.SrcFuncs {
+		if obj := ssaFn.Object(); obj != nil {
+			if fn, ok := obj.(*types.Func); ok {
+				ssaFuncMap[fn] = ssaFn
+			}
+		}
+	}
+	return ssaFuncMap
 }
 
 // newSSAAnalyzer creates a new SSA analyzer.
-func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, interfaceImpls *interfaceImplementations) *ssaAnalyzer {
+func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, interfaceImpls *interfaceImplementations, ssaFuncMap map[*types.Func]*ssa.Function) *ssaAnalyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	return &ssaAnalyzer{
 		pass:                pass,
@@ -29,17 +43,13 @@ func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[
 		localFacts:          localFacts,
 		localParamFlowFacts: localParamFlowFacts,
 		interfaceImpls:      interfaceImpls,
+		ssaFuncMap:          ssaFuncMap,
 	}
 }
 
 // findSSAFunction finds the SSA function corresponding to a types.Func.
 func (a *ssaAnalyzer) findSSAFunction(fn *types.Func) *ssa.Function {
-	for _, ssaFn := range a.ssaResult.SrcFuncs {
-		if ssaFn.Object() == fn {
-			return ssaFn
-		}
-	}
-	return nil
+	return a.ssaFuncMap[fn]
 }
 
 // traceReturnStatements analyzes return statements in a function using SSA.
