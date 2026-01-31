@@ -1016,6 +1016,13 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []facts.ErrorInfo
 				errs = append(errs, fnFact.Errors...)
 			}
 		}
+		// Also check for named functions (e.g., passing namedFunc to a higher-order function)
+		if funcObj, ok := obj.(*types.Func); ok {
+			var fnFact facts.FunctionErrorsFact
+			if pass.ImportObjectFact(funcObj, &fnFact) {
+				errs = append(errs, fnFact.Errors...)
+			}
+		}
 
 	case *ast.SelectorExpr:
 		obj := pass.TypesInfo.Uses[e.Sel]
@@ -1027,6 +1034,13 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []facts.ErrorInfo
 					Name:    errorFact.Name,
 					Wrapped: false,
 				})
+			}
+		}
+		// Also check for named functions (e.g., passing pkg.NamedFunc to a higher-order function)
+		if funcObj, ok := obj.(*types.Func); ok {
+			var fnFact facts.FunctionErrorsFact
+			if pass.ImportObjectFact(funcObj, &fnFact) {
+				errs = append(errs, fnFact.Errors...)
 			}
 		}
 

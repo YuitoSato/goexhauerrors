@@ -19,11 +19,12 @@ type Analyzer struct {
 	LocalErrs           *detector.LocalErrors
 	LocalFacts          map[*types.Func]*facts.FunctionErrorsFact
 	LocalParamFlowFacts map[*types.Func]*facts.ParameterFlowFact
+	LocalCallFlowFacts  map[*types.Func]*facts.FunctionParamCallFlowFact
 	InterfaceImpls      *internal.InterfaceImplementations
 }
 
 // NewAnalyzer creates a new SSA analyzer.
-func NewAnalyzer(pass *analysis.Pass, localErrs *detector.LocalErrors, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, interfaceImpls *internal.InterfaceImplementations) *Analyzer {
+func NewAnalyzer(pass *analysis.Pass, localErrs *detector.LocalErrors, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, localCallFlowFacts map[*types.Func]*facts.FunctionParamCallFlowFact, interfaceImpls *internal.InterfaceImplementations) *Analyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	return &Analyzer{
 		pass:                pass,
@@ -31,6 +32,7 @@ func NewAnalyzer(pass *analysis.Pass, localErrs *detector.LocalErrors, localFact
 		LocalErrs:           localErrs,
 		LocalFacts:          localFacts,
 		LocalParamFlowFacts: localParamFlowFacts,
+		LocalCallFlowFacts:  localCallFlowFacts,
 		InterfaceImpls:      interfaceImpls,
 	}
 }
@@ -170,7 +172,7 @@ func (a *Analyzer) filterIgnoredPackages(errs []facts.ErrorInfo) []facts.ErrorIn
 }
 
 // getErrorsFromCall extracts error information from a function call.
-// Only returns errors if the called function has FunctionErrorsFact.
+// It resolves FunctionErrorsFact, ParameterFlowFact, and FunctionParamCallFlowFact.
 func (a *Analyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
 	// Check for interface method call (invoke mode)
 	if call.Call.IsInvoke() {
@@ -219,6 +221,22 @@ func (a *Analyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool,
 	if flowFact != nil {
 		paramFlowErrs := a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee, visited, depth)
 		errs = append(errs, paramFlowErrs...)
+	}
+
+	// Also resolve errors through FunctionParamCallFlowFact for higher-order function calls
+	var callFlowFact *facts.FunctionParamCallFlowFact
+	if localCF, ok := a.LocalCallFlowFacts[typesFunc]; ok {
+		callFlowFact = localCF
+	}
+	var importedCF facts.FunctionParamCallFlowFact
+	if a.pass.ImportObjectFact(typesFunc, &importedCF) {
+		if callFlowFact == nil {
+			callFlowFact = &importedCF
+		}
+	}
+	if callFlowFact != nil {
+		callFlowErrs := a.resolveFunctionParamCallFlowForStaticCall(call, callFlowFact, callee, visited, depth)
+		errs = append(errs, callFlowErrs...)
 	}
 
 	return errs
@@ -361,6 +379,102 @@ func (a *Analyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowF
 			}
 		}
 		errs = append(errs, argErrs...)
+	}
+
+	return errs
+}
+
+// resolveFunctionParamCallFlowForStaticCall resolves errors from function-typed arguments
+// passed to a higher-order function based on FunctionParamCallFlowFact.
+// For example, if RunInTx(fn) has CallFlow for param 0 and fn has FunctionErrorsFact [ErrNotFound],
+// this returns [ErrNotFound].
+func (a *Analyzer) resolveFunctionParamCallFlowForStaticCall(call *ssa.Call, callFlowFact *facts.FunctionParamCallFlowFact, callee *ssa.Function, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
+	args := call.Call.Args
+
+	// For methods, SSA args include the receiver at index 0
+	receiverOffset := 0
+	sig := callee.Signature
+	if sig.Recv() != nil {
+		receiverOffset = 1
+	}
+
+	for _, flow := range callFlowFact.CallFlows {
+		argIdx := flow.ParamIndex + receiverOffset
+		if argIdx >= len(args) {
+			continue
+		}
+
+		argErrs := a.getErrorsFromFunctionValue(args[argIdx], visited, depth+1)
+		for i := range argErrs {
+			if flow.Wrapped {
+				argErrs[i].Wrapped = true
+			}
+		}
+		errs = append(errs, argErrs...)
+	}
+
+	return errs
+}
+
+// getErrorsFromFunctionValue extracts errors from a function-typed SSA value.
+// It handles function references (MakeClosure, named functions) by looking up their FunctionErrorsFact.
+func (a *Analyzer) getErrorsFromFunctionValue(val ssa.Value, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
+	if val == nil || visited[val] || depth > maxTraceDepth {
+		return nil
+	}
+	visited[val] = true
+
+	switch v := val.(type) {
+	case *ssa.MakeClosure:
+		// Closure - try to look up FunctionErrorsFact of the underlying function.
+		// Note: Anonymous closures typically have fn.Object() == nil, so this
+		// won't resolve them. Inline closures are handled by the AST path instead.
+		if fn, ok := v.Fn.(*ssa.Function); ok {
+			return a.getFunctionErrorsFact(fn)
+		}
+
+	case *ssa.Function:
+		// Direct function reference
+		return a.getFunctionErrorsFact(v)
+
+	case *ssa.Phi:
+		// Merge from different branches
+		var errs []facts.ErrorInfo
+		for _, edge := range v.Edges {
+			errs = append(errs, a.getErrorsFromFunctionValue(edge, visited, depth+1)...)
+		}
+		return errs
+
+	case *ssa.ChangeInterface:
+		return a.getErrorsFromFunctionValue(v.X, visited, depth+1)
+	}
+
+	return nil
+}
+
+// getFunctionErrorsFact retrieves the FunctionErrorsFact for an SSA function.
+func (a *Analyzer) getFunctionErrorsFact(fn *ssa.Function) []facts.ErrorInfo {
+	obj := fn.Object()
+	if obj == nil {
+		return nil
+	}
+	typesFunc, ok := obj.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	var errs []facts.ErrorInfo
+
+	// Check local facts first
+	if localFact, ok := a.LocalFacts[typesFunc]; ok {
+		errs = append(errs, localFact.Errors...)
+	}
+
+	// Also check imported facts
+	var fnFact facts.FunctionErrorsFact
+	if a.pass.ImportObjectFact(typesFunc, &fnFact) {
+		errs = append(errs, fnFact.Errors...)
 	}
 
 	return errs
