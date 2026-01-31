@@ -51,7 +51,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	computeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
 
 	// Phase 3: Check call sites for exhaustive errors.Is checks
-	checkCallSites(pass)
+	checkCallSites(pass, interfaceImpls)
 
 	return nil, nil
 }
