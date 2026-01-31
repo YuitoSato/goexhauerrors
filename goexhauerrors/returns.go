@@ -73,8 +73,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 	ssaFuncMap := buildSSAFuncMap(ssaResult)
 
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
-	const maxIterations = 10
-	for iteration := 0; iteration < maxIterations; iteration++ {
+	for {
 		changed := false
 
 		// Create SSA analyzer with current local facts
