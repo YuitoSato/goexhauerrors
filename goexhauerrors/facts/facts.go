@@ -128,11 +128,11 @@ func (f *ParameterFlowFact) String() string {
 
 // AddFlow adds a parameter flow to the fact if not already present.
 func (f *ParameterFlowFact) AddFlow(flow ParameterFlowInfo) {
-	for _, existing := range f.Flows {
-		if existing.ParamIndex == flow.ParamIndex {
+	for i := range f.Flows {
+		if f.Flows[i].ParamIndex == flow.ParamIndex {
 			// If already exists, upgrade to wrapped if needed
-			if flow.Wrapped && !existing.Wrapped {
-				existing.Wrapped = true
+			if flow.Wrapped && !f.Flows[i].Wrapped {
+				f.Flows[i].Wrapped = true
 			}
 			return
 		}

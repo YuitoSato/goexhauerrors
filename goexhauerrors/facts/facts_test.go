@@ -237,16 +237,12 @@ func TestParameterFlowFact_AddFlow(t *testing.T) {
 		}
 	})
 
-	// NOTE: The upgrade logic in AddFlow iterates by value, so the mutation
-	// of existing.Wrapped doesn't actually persist. This test documents the
-	// current behaviour.
-	t.Run("upgrade wrapped false to true (current behaviour)", func(t *testing.T) {
+	t.Run("upgrade wrapped false to true", func(t *testing.T) {
 		f := &ParameterFlowFact{}
 		f.AddFlow(ParameterFlowInfo{ParamIndex: 0, Wrapped: false})
 		f.AddFlow(ParameterFlowInfo{ParamIndex: 0, Wrapped: true})
-		// Because range iterates by value, the upgrade is not persisted.
-		if f.Flows[0].Wrapped != false {
-			t.Fatalf("expected Wrapped=false (current behaviour), got true")
+		if !f.Flows[0].Wrapped {
+			t.Fatalf("expected Wrapped=true after upgrade, got false")
 		}
 	})
 
@@ -417,7 +413,7 @@ func TestFunctionParamCallFlowFact_AddCallFlow(t *testing.T) {
 		f := &FunctionParamCallFlowFact{}
 		f.AddCallFlow(FunctionParamCallFlowInfo{ParamIndex: 0, Wrapped: false})
 		f.AddCallFlow(FunctionParamCallFlowInfo{ParamIndex: 0, Wrapped: true})
-		// Unlike ParameterFlowFact, this uses index-based mutation so it persists.
+		// Index-based mutation ensures the upgrade persists.
 		if !f.CallFlows[0].Wrapped {
 			t.Error("expected Wrapped=true after upgrade")
 		}
