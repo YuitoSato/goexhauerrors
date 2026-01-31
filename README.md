@@ -1,12 +1,56 @@
 # goexhauerrors
 
-A Go static analysis tool that verifies all error types (sentinel errors and custom error types) returned by functions are exhaustively checked at call sites.
+A Go linter that ensures all error types returned by functions are exhaustively checked at call sites.
 
-## Overview
+## What It Catches
 
-In Go, `errors.Is` and `errors.As` are used to identify error types, but it's easy to forget to check all possible errors a function may return. This linter detects such omissions for both:
-- Sentinel errors: `var Err* = errors.New("...")`
-- Custom error types: Structs implementing the `error` interface
+```go
+var ErrNotFound  = errors.New("not found")
+var ErrPermission = errors.New("permission denied")
+
+func GetItem(id string) (string, error) {
+    if id == "" {
+        return "", ErrNotFound
+    }
+    if !hasAccess(id) {
+        return "", ErrPermission
+    }
+    return "item", nil
+}
+```
+
+**Bad** - Only checks `err != nil`, missing specific error handling:
+
+```go
+_, err := GetItem("test")
+if err != nil {       // goexhauerrors: missing errors.Is check for ErrNotFound, ErrPermission
+    log.Fatal(err)
+}
+```
+
+**Good** - All error types are exhaustively checked:
+
+```go
+_, err := GetItem("test")
+if errors.Is(err, ErrNotFound) {
+    println("not found")
+} else if errors.Is(err, ErrPermission) {
+    println("permission denied")
+}
+```
+
+**Good** - Propagating the error to the caller (no check required):
+
+```go
+func Handler() error {
+    _, err := GetItem("test")
+    return fmt.Errorf("handler failed: %w", err)  // OK - wrapped and propagated
+}
+```
+
+## Why?
+
+Go's `errors.Is` and `errors.As` let callers inspect specific error types, but nothing enforces that callers actually check **all** possible errors. When a function adds a new error type, callers that only do `if err != nil` silently swallow it. This linter catches those gaps at compile time.
 
 ## Installation
 
@@ -14,34 +58,35 @@ In Go, `errors.Is` and `errors.As` are used to identify error types, but it's ea
 go install github.com/YuitoSato/goexhauerrors@latest
 ```
 
-## Quick Start
-
-```go
-var ErrNotFound = errors.New("not found")  // Detected as sentinel
-
-func GetItem(id string) (string, error) {
-    if id == "" {
-        return "", ErrNotFound  // Tracked
-    }
-    return "item", nil
-}
-
-func main() {
-    _, err := GetItem("")
-    // Warning: missing errors.Is check for ErrNotFound
-    if err != nil {
-        log.Fatal(err)
-    }
-}
-```
-
-Run the linter:
+## Usage
 
 ```bash
 goexhauerrors ./...
 ```
 
-## What It Detects
+### Ignoring Packages
+
+Exclude specific packages (e.g., standard library, third-party) from error checking:
+
+```bash
+goexhauerrors -ignorePackages="gorm.io/gorm,database/sql" ./...
+```
+
+### golangci-lint (Plugin)
+
+`.golangci.yml`:
+
+```yaml
+linters-settings:
+  custom:
+    exhaustiveerrors:
+      path: path/to/plugin.so
+      description: Exhaustive error type checking
+```
+
+---
+
+## Detected Patterns
 
 ### Sentinel Errors
 
@@ -66,29 +111,37 @@ func (e *ValidationError) Error() string {
 }
 ```
 
-## How It Tracks Errors
-
-### Direct Returns
-
-Functions that directly return sentinel errors:
+Check with `errors.As` or type switch:
 
 ```go
-func GetItem(id string) (string, error) {
-    if id == "" {
-        return "", ErrNotFound
-    }
-    return "item", nil
+err := Validate("")
+var ve *ValidationError
+if errors.As(err, &ve) {
+    println("field:", ve.Field)
 }
 ```
 
 ### Wrapped Errors (%w)
 
-Errors wrapped with `fmt.Errorf` using `%w`:
+Errors wrapped with `fmt.Errorf` are tracked through the wrapping:
 
 ```go
 func Query() error {
     return fmt.Errorf("query failed: %w", ErrDatabase)
 }
+
+func Caller() {
+    err := Query()
+    if errors.Is(err, ErrDatabase) {  // OK
+        println("database error")
+    }
+}
+```
+
+Note: `%v` is NOT treated as propagation because the original error is lost:
+
+```go
+return fmt.Errorf("failed: %v", err)  // Warning: missing errors.Is check
 ```
 
 ### Variable Propagation (SSA-based)
@@ -96,12 +149,10 @@ func Query() error {
 Errors assigned to variables and returned later are tracked using SSA dataflow analysis:
 
 ```go
-func Inner() error {
-    return ErrDatabase
-}
+func Inner() error { return ErrDatabase }
 
 func Outer() error {
-    err := Inner()  // SSA tracks: err holds ErrDatabase
+    err := Inner()
     return err      // Detected: propagates ErrDatabase
 }
 
@@ -110,25 +161,9 @@ func Caller() {
 }
 ```
 
-Works across packages:
+### Conditional Branches
 
-```go
-// package errors
-func GetError() error { return ErrCrossPkg }
-
-// package middle
-func PropagateViaVar() error {
-    err := errors.GetError()
-    return err  // SSA tracks cross-package propagation
-}
-
-// package caller
-func BadCaller() {
-    err := middle.PropagateViaVar()  // Warning: missing errors.Is check
-}
-```
-
-Handles conditional branches (Phi nodes):
+Both branches of conditionals are tracked:
 
 ```go
 func ConditionalReturn(cond bool) error {
@@ -142,186 +177,42 @@ func ConditionalReturn(cond bool) error {
 }
 ```
 
-### Factory Functions & Closures
+### Cross-Package Propagation
 
-Factory functions:
+Error tracking works across package boundaries:
 
 ```go
+// package errors
+func GetError() error { return ErrCrossPkg }
+
+// package middle
+func Propagate() error {
+    err := errors.GetError()
+    return err  // SSA tracks cross-package propagation
+}
+
+// package caller
+func BadCaller() {
+    err := middle.Propagate()  // Warning: missing errors.Is check
+}
+```
+
+### Factory Functions & Closures
+
+```go
+// Factory function
 func NewValidationError(field string) error {
     return &ValidationError{Field: field}
 }
 
-func UseFactory() error {
-    return NewValidationError("name")  // Tracks ValidationError
-}
-```
-
-Closures:
-
-```go
-func UseClosure() {
-    handler := func() error {
-        return ErrHandler
-    }
-    err := handler()  // Warning: missing errors.Is check for ErrHandler
-}
-```
-
-## Call Site Analysis
-
-### Required Checks
-
-Use `errors.Is`, `errors.As`, direct comparison (`==`/`!=`), or type switch to check errors:
-
-```go
-// if-else chain with errors.Is
-func GoodCaller() {
-    _, err := GetItem("test")
-    if errors.Is(err, ErrNotFound) {
-        println("not found")
-    } else if errors.Is(err, ErrPermission) {
-        println("permission denied")
-    }
-}
-
-// switch statement with errors.Is
-func SwitchCaller() {
-    _, err := GetItem("test")
-    switch {
-    case errors.Is(err, ErrNotFound):
-        println("not found")
-    case errors.Is(err, ErrPermission):
-        println("permission denied")
-    }
-}
-
-// direct comparison (== / !=)
-func DirectCompareCaller() {
-    _, err := GetItem("test")
-    if err == ErrNotFound {
-        println("not found")
-    } else if err == ErrPermission {
-        println("permission denied")
-    }
-}
-
-// switch with error tag
-func SwitchTagCaller() {
-    _, err := GetItem("test")
-    switch err {
-    case ErrNotFound:
-        println("not found")
-    case ErrPermission:
-        println("permission denied")
-    }
-}
-
-// custom error types with errors.As
-func CheckCustomType() {
-    err := Validate("")
-    var validationErr *ValidationError
-    if errors.As(err, &validationErr) {
-        println("validation error on field:", validationErr.Field)
-    }
-}
-
-// type switch
-func TypeSwitchCaller() {
-    err := Validate("")
-    switch err.(type) {
-    case *ValidationError:
-        println("validation error")
-    }
-}
-```
-
-### Checks Inside defer and select
-
-Error checks inside `defer` statements and `select` case bodies are recognized:
-
-```go
-func DeferCaller() {
-    _, err := GetItem("test")
-    defer func() {
-        if errors.Is(err, ErrNotFound) {
-            println("not found")
-        }
-        if errors.Is(err, ErrPermission) {
-            println("permission")
-        }
-    }()
-}
-
-func SelectCaller() {
-    _, err := GetItem("test")
-    ch := make(chan struct{})
-    select {
-    case <-ch:
-        if errors.Is(err, ErrNotFound) {
-            println("not found")
-        }
-        if errors.Is(err, ErrPermission) {
-            println("permission")
-        }
-    }
-}
-```
-
-### Function Literals
-
-Error handling inside anonymous functions, immediately-invoked function literals, and goroutine closures is analyzed:
-
-```go
-func FuncLitCaller() {
-    fn := func() {
-        _, err := GetItem("test")
-        // Warning: missing errors.Is check for ErrNotFound, ErrPermission
-        if err != nil {
-            println(err.Error())
-        }
-    }
-    fn()
-}
-```
-
-### Function Parameter Tracking
-
-Errors passed through function parameters are tracked:
-
-```go
-func WrapError(err error) error {
-    return fmt.Errorf("wrapped: %w", err)
-}
-
-func Caller() {
-    err := WrapError(ErrNotFound)  // Warning: missing errors.Is check for ErrNotFound
-    if err != nil {
-        println(err.Error())
-    }
-}
-
-func CallerGood() {
-    err := WrapError(ErrNotFound)
-    if errors.Is(err, ErrNotFound) {
-        println("not found")  // OK
-    }
-}
-```
-
-Chained wrappers are also supported:
-
-```go
-func Wrapper1(err error) error { return Wrapper2(err) }
-func Wrapper2(err error) error { return err }
-
-func Test() {
-    err := Wrapper1(ErrNotFound)  // Warning: ErrNotFound flows through both wrappers
-}
+// Closure
+handler := func() error { return ErrHandler }
+err := handler()  // Warning: missing errors.Is check for ErrHandler
 ```
 
 ### Interface Method Calls
 
-Errors from interface method implementations are tracked by analyzing all concrete implementations:
+All concrete implementations are analyzed, and the union of their errors is tracked:
 
 ```go
 type Repository interface {
@@ -329,19 +220,19 @@ type Repository interface {
 }
 
 type UserRepo struct{}
+func (r *UserRepo) Get(id string) error { return ErrNotFound }
 
-func (r *UserRepo) Get(id string) error {
-    return ErrNotFound  // Tracked
-}
+type CacheRepo struct{}
+func (r *CacheRepo) Get(id string) error { return ErrCacheMiss }
 
 func Use(repo Repository) {
-    err := repo.Get("123")  // Warning: missing errors.Is check for ErrNotFound
+    err := repo.Get("123")  // Warning: missing checks for ErrNotFound AND ErrCacheMiss
 }
 ```
 
-### Higher-Order Functions (Lambda)
+### Higher-Order Functions
 
-Errors from lambda functions passed to higher-order functions are detected:
+Errors from functions passed as arguments are tracked:
 
 ```go
 func RunInTx(fn func() error) error {
@@ -350,94 +241,40 @@ func RunInTx(fn func() error) error {
 
 func Caller() {
     err := RunInTx(func() error {
-        return ErrNotFound  // Tracked through higher-order function
+        return ErrNotFound
     })
     // Warning: missing errors.Is check for ErrNotFound
 }
 ```
 
-### No Check Required (Propagation)
+### Function Parameter Tracking
 
-When propagating errors to the caller, no check is required:
-
-```go
-func Handler() error {
-    _, err := GetItem("test")
-    return err  // OK - propagating error
-}
-```
-
-Wrapping with `fmt.Errorf` using `%w` is also treated as propagation since the original error is still detectable via `errors.Is`:
+Errors passed through function parameters are tracked, including chained wrappers:
 
 ```go
-func Handler() error {
-    _, err := GetItem("test")
-    return fmt.Errorf("handler failed: %w", err)  // OK - error is wrapped but still detectable
+func WrapError(err error) error {
+    return fmt.Errorf("wrapped: %w", err)
 }
-```
 
-Note: `fmt.Errorf` with `%v` is NOT treated as propagation because the original error is lost and cannot be detected via `errors.Is`:
-
-```go
-func Handler() error {
-    _, err := GetItem("test")
-    return fmt.Errorf("handler failed: %v", err)  // Warning: missing errors.Is check
-}
+err := WrapError(ErrNotFound)  // Warning: missing errors.Is check for ErrNotFound
 ```
 
 ### Error Checking Inside Called Functions
 
-When a function receives an error parameter and checks it with `errors.Is`/`errors.As` internally, those checks are reflected to the caller. Only the **unchecked** errors are reported:
+When a function checks some errors internally, only the unchecked errors are reported:
 
 ```go
-var ErrNotFound = errors.New("not found")
-var ErrPermission = errors.New("permission denied")
-var ErrTimeout = errors.New("timeout")
-
-func GetItem() error { /* returns all three errors */ }
-
-// MapError checks 2 of 3 errors internally
 func MapError(err error) error {
     if errors.Is(err, ErrNotFound) {
         return errors.New("mapped: not found")
     }
-    if errors.Is(err, ErrPermission) {
-        return errors.New("mapped: permission denied")
-    }
-    // ErrTimeout is NOT checked
     return nil
 }
 
 func Caller() error {
-    err := GetItem()
-    return MapError(err)  // Warning: missing errors.Is check for ErrTimeout
-    // ErrNotFound and ErrPermission are already checked inside MapError
-}
-```
-
-If the function checks **all** possible errors, no warning is reported:
-
-```go
-func MapErrorComplete(err error) error {
-    if errors.Is(err, ErrNotFound) { return errors.New("mapped") }
-    if errors.Is(err, ErrPermission) { return errors.New("mapped") }
-    if errors.Is(err, ErrTimeout) { return errors.New("mapped") }
-    return nil
-}
-
-func CallerGood() error {
-    err := GetItem()
-    return MapErrorComplete(err)  // OK - all errors checked inside MapErrorComplete
-}
-```
-
-This also works with assignment (non-return) patterns:
-
-```go
-func CallerAssign() error {
-    err := GetItem()
-    result := MapError(err)  // Warning: missing errors.Is check for ErrTimeout
-    return result
+    err := GetItem()           // returns ErrNotFound, ErrPermission
+    return MapError(err)       // Warning: missing errors.Is check for ErrPermission
+    // ErrNotFound is already checked inside MapError
 }
 ```
 
@@ -446,81 +283,51 @@ func CallerAssign() error {
 After reassignment, only the new error types are tracked:
 
 ```go
-func ReassignExample() {
-    err := GetItem()  // ErrNotFound
-    if errors.Is(err, ErrNotFound) {
-        println("handled")
-    }
+err := GetItem()   // ErrNotFound
+if errors.Is(err, ErrNotFound) { /* handled */ }
 
-    err = GetOther()  // Reassigned: now only ErrTimeout is tracked
-    // Only ErrTimeout check required here
-}
+err = GetOther()   // Reassigned: now only ErrTimeout is tracked
+if errors.Is(err, ErrTimeout) { /* handled */ }
 ```
+
+---
+
+## Accepted Check Patterns
+
+All of the following patterns are recognized as valid error checks:
+
+| Pattern | Example |
+|---------|---------|
+| `errors.Is` | `errors.Is(err, ErrNotFound)` |
+| `errors.As` | `errors.As(err, &validationErr)` |
+| Direct comparison | `err == ErrNotFound` |
+| Switch on error | `switch err { case ErrNotFound: }` |
+| Type switch | `switch err.(type) { case *ValidationError: }` |
+| Inside `defer` | `defer func() { if errors.Is(err, ...) }()` |
+| Inside `select` | `select { case <-ch: errors.Is(err, ...) }` |
+| Propagation (`return`) | `return err` or `return fmt.Errorf("...: %w", err)` |
+
+---
 
 ## Limitations
 
-The following patterns are NOT detected:
-
-### Unexported Errors (Cross-Package)
-
-Unexported errors are tracked within the same package but are not exported as facts for cross-package analysis:
-
-```go
-var errInternal = errors.New("internal")  // Tracked within the same package
-var ErrPublic = errors.New("public")      // Tracked and exported for cross-package analysis
-```
-
-Callers in the same package will be warned about unchecked unexported errors. Callers in other packages will only see exported errors.
-
-### Struct/Map Field Storage
-
-```go
-type Container struct {
-    Err error
-}
-
-func caller() {
-    c := &Container{}
-    _, c.Err = GetItem("test")  // Field assignment not tracked
-}
-```
+| Pattern | Status |
+|---------|--------|
+| Unexported errors (cross-package) | Not tracked across packages (by design) |
+| Struct/map field storage | Not tracked |
+| Dynamic error creation (`errors.New(variable)`) | Not tracked |
 
 ### Ignoring Packages
 
-You can exclude specific packages from error checking using the `-ignorePackages` flag:
+External errors (e.g., `sql.ErrNoRows`, `gorm.ErrRecordNotFound`) should be converted to your domain errors at API boundaries. Use `-ignorePackages` to exclude them:
 
 ```bash
-goexhauerrors -ignorePackages="gorm.io/gorm,database/sql" ./...
+goexhauerrors -ignorePackages="gorm.io/gorm,database/sql,strconv" ./...
 ```
 
-This is useful for excluding standard library or third-party package errors:
+---
 
-```go
-import (
-    "database/sql"
-    "gorm.io/gorm"
-)
-
-func Query() error {
-    return sql.ErrNoRows  // Ignored if "database/sql" is in ignorePackages
-}
-
-func FindUser() error {
-    return gorm.ErrRecordNotFound  // Ignored if "gorm.io/gorm" is in ignorePackages
-}
-```
-
-External errors should be converted to your domain errors at API boundaries.
-
-### Dynamic Error Creation
-
-```go
-func CreateError(msg string) error {
-    return errors.New(msg)  // Dynamic, not static sentinel
-}
-```
-
-## Summary
+## Feature Summary
 
 | Category | Pattern | Detected |
 |----------|---------|----------|
@@ -536,7 +343,6 @@ func CreateError(msg string) error {
 | | Closures | Yes |
 | | Function literals | Yes |
 | | Variable reassignment | Yes |
-| | Concrete type methods | Yes |
 | | Function parameters | Yes |
 | | Error checks inside called functions | Yes |
 | | Interface method calls | Yes |
@@ -545,44 +351,10 @@ func CreateError(msg string) error {
 | | Direct comparison (`==` / `!=`) | Yes |
 | | Type switch (`switch err.(type)`) | Yes |
 | | Switch with error tag (`switch err`) | Yes |
-| | Inside `defer` statements | Yes |
-| | Inside `select` case bodies | Yes |
-| Not Supported | Unexported errors (cross-package) | No (by design) |
+| | Inside `defer` / `select` | Yes |
+| Not Supported | Unexported errors (cross-package) | No |
 | | Struct/map field storage | No |
-| | Ignored packages | No (use -ignorePackages flag) |
 | | Dynamic error creation | No |
-
-## Usage
-
-### Standalone
-
-```bash
-goexhauerrors ./...
-```
-
-### Ignoring Packages
-
-Use the `-ignorePackages` flag to exclude specific packages from error checking:
-
-```bash
-# Ignore a single package
-goexhauerrors -ignorePackages="gorm.io/gorm" ./...
-
-# Ignore multiple packages (comma-separated)
-goexhauerrors -ignorePackages="gorm.io/gorm,database/sql,strconv" ./...
-```
-
-### golangci-lint (Plugin)
-
-`.golangci.yml`:
-
-```yaml
-linters-settings:
-  custom:
-    exhaustiveerrors:
-      path: path/to/plugin.so
-      description: Exhaustive error type checking
-```
 
 ## License
 
