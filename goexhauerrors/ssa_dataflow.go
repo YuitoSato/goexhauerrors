@@ -96,7 +96,7 @@ func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bo
 	switch v := val.(type) {
 	case *ssa.Call:
 		// Function call result - get errors from the called function's facts only
-		callErrs := a.getErrorsFromCall(v)
+		callErrs := a.getErrorsFromCall(v, visited, depth)
 		errs = append(errs, callErrs...)
 
 		// Also resolve errors via ParameterFlowFact
@@ -168,10 +168,10 @@ func (a *ssaAnalyzer) filterIgnoredPackages(errs []ErrorInfo) []ErrorInfo {
 
 // getErrorsFromCall extracts error information from a function call.
 // Only returns errors if the called function has FunctionErrorsFact.
-func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
+func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
 	// Check for interface method call (invoke mode)
 	if call.Call.IsInvoke() {
-		return a.getErrorsFromInvoke(call)
+		return a.getErrorsFromInvoke(call, visited, depth)
 	}
 
 	var errs []ErrorInfo
@@ -214,7 +214,7 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
 		}
 	}
 	if flowFact != nil {
-		paramFlowErrs := a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee)
+		paramFlowErrs := a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee, visited, depth)
 		errs = append(errs, paramFlowErrs...)
 	}
 
@@ -224,7 +224,7 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call) []ErrorInfo {
 // getErrorsFromInvoke extracts error information from an interface method call.
 // It collects errors from all known implementations of the interface method,
 // and also resolves ParameterFlowFact to trace errors through parameters.
-func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
+func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
 	ifaceMethod := call.Call.Method
 	if ifaceMethod == nil {
 		return nil
@@ -242,7 +242,7 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 	// Check ParameterFlowFact on the interface method (exported as intersection of impls)
 	var flowFact ParameterFlowFact
 	if a.pass.ImportObjectFact(ifaceMethod, &flowFact) {
-		paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, &flowFact)
+		paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, &flowFact, visited, depth)
 		allErrors = append(allErrors, paramFlowErrs...)
 	}
 
@@ -298,7 +298,7 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 		}
 		intersected := intersectParameterFlowFacts(implFlowFacts)
 		if intersected != nil {
-			paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, intersected)
+			paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, intersected, visited, depth)
 			allErrors = append(allErrors, paramFlowErrs...)
 		}
 	}
@@ -309,7 +309,7 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call) []ErrorInfo {
 // resolveParameterFlowErrorsForInvoke resolves concrete errors passed as arguments
 // to an interface method call (invoke mode) based on ParameterFlowFact.
 // In invoke mode, call.Call.Args contains only method arguments (no receiver).
-func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFact *ParameterFlowFact) []ErrorInfo {
+func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFact *ParameterFlowFact, visited map[ssa.Value]bool, depth int) []ErrorInfo {
 	var errs []ErrorInfo
 	args := call.Call.Args
 
@@ -319,7 +319,7 @@ func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFa
 			continue
 		}
 
-		argErrs := a.traceValueToErrors(args[argIdx], make(map[ssa.Value]bool), 0)
+		argErrs := a.traceValueToErrors(args[argIdx], visited, depth+1)
 		for i := range argErrs {
 			if flow.Wrapped {
 				argErrs[i].Wrapped = true
@@ -334,7 +334,7 @@ func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFa
 // resolveParameterFlowErrorsForStaticCall resolves concrete errors passed as arguments
 // to a static function/method call based on ParameterFlowFact.
 // For method calls, args[0] is the receiver, so ParamIndex must be offset by 1.
-func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowFact *ParameterFlowFact, callee *ssa.Function) []ErrorInfo {
+func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowFact *ParameterFlowFact, callee *ssa.Function, visited map[ssa.Value]bool, depth int) []ErrorInfo {
 	var errs []ErrorInfo
 	args := call.Call.Args
 
@@ -351,7 +351,7 @@ func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, fl
 			continue
 		}
 
-		argErrs := a.traceValueToErrors(args[argIdx], make(map[ssa.Value]bool), 0)
+		argErrs := a.traceValueToErrors(args[argIdx], visited, depth+1)
 		for i := range argErrs {
 			if flow.Wrapped {
 				argErrs[i].Wrapped = true
@@ -643,8 +643,12 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 					flows := a.traceValueToParameters(ret.Results[pos], ssaFn.Params, make(map[ssa.Value]bool), 0)
 					for _, flow := range flows {
 						// Adjust parameter index for methods (receiver is not in call.Args)
+						adjustedIndex := flow.ParamIndex - receiverOffset
+						if adjustedIndex < 0 {
+							continue
+						}
 						adjustedFlow := ParameterFlowInfo{
-							ParamIndex: flow.ParamIndex - receiverOffset,
+							ParamIndex: adjustedIndex,
 							Wrapped:    flow.Wrapped,
 						}
 						fact.AddFlow(adjustedFlow)
@@ -692,8 +696,12 @@ func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions
 					flows := a.traceValueToFunctionParamCalls(ret.Results[pos], ssaFn.Params, make(map[ssa.Value]bool), 0)
 					for _, flow := range flows {
 						// Adjust parameter index for methods (receiver is not in call.Args)
+						adjustedIndex := flow.ParamIndex - receiverOffset
+						if adjustedIndex < 0 {
+							continue
+						}
 						adjustedFlow := FunctionParamCallFlowInfo{
-							ParamIndex: flow.ParamIndex - receiverOffset,
+							ParamIndex: adjustedIndex,
 							Wrapped:    flow.Wrapped,
 						}
 						fact.AddCallFlow(adjustedFlow)
