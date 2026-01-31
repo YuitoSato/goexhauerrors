@@ -1,39 +1,42 @@
-package goexhauerrors
+package ssaanalysis
 
 import (
 	"go/token"
 	"go/types"
 
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/detector"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/facts"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/internal"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
 )
 
-// ssaAnalyzer provides SSA-based dataflow analysis for tracking error values.
-type ssaAnalyzer struct {
+// Analyzer provides SSA-based dataflow analysis for tracking error values.
+type Analyzer struct {
 	pass                *analysis.Pass
 	ssaResult           *buildssa.SSA
-	localErrs           *localErrors
-	localFacts          map[*types.Func]*FunctionErrorsFact
-	localParamFlowFacts map[*types.Func]*ParameterFlowFact
-	interfaceImpls      *interfaceImplementations
+	LocalErrs           *detector.LocalErrors
+	LocalFacts          map[*types.Func]*facts.FunctionErrorsFact
+	LocalParamFlowFacts map[*types.Func]*facts.ParameterFlowFact
+	InterfaceImpls      *internal.InterfaceImplementations
 }
 
-// newSSAAnalyzer creates a new SSA analyzer.
-func newSSAAnalyzer(pass *analysis.Pass, localErrs *localErrors, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, interfaceImpls *interfaceImplementations) *ssaAnalyzer {
+// NewAnalyzer creates a new SSA analyzer.
+func NewAnalyzer(pass *analysis.Pass, localErrs *detector.LocalErrors, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, interfaceImpls *internal.InterfaceImplementations) *Analyzer {
 	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	return &ssaAnalyzer{
+	return &Analyzer{
 		pass:                pass,
 		ssaResult:           ssaResult,
-		localErrs:           localErrs,
-		localFacts:          localFacts,
-		localParamFlowFacts: localParamFlowFacts,
-		interfaceImpls:      interfaceImpls,
+		LocalErrs:           localErrs,
+		LocalFacts:          localFacts,
+		LocalParamFlowFacts: localParamFlowFacts,
+		InterfaceImpls:      interfaceImpls,
 	}
 }
 
-// findSSAFunction finds the SSA function corresponding to a types.Func.
-func (a *ssaAnalyzer) findSSAFunction(fn *types.Func) *ssa.Function {
+// FindSSAFunction finds the SSA function corresponding to a types.Func.
+func (a *Analyzer) FindSSAFunction(fn *types.Func) *ssa.Function {
 	for _, ssaFn := range a.ssaResult.SrcFuncs {
 		if ssaFn.Object() == fn {
 			return ssaFn
@@ -42,16 +45,16 @@ func (a *ssaAnalyzer) findSSAFunction(fn *types.Func) *ssa.Function {
 	return nil
 }
 
-// traceReturnStatements analyzes return statements in a function using SSA.
+// TraceReturnStatements analyzes return statements in a function using SSA.
 // It returns additional errors discovered through SSA analysis by tracking
 // error values through local variables.
-func (a *ssaAnalyzer) traceReturnStatements(fn *types.Func, errorPositions []int) []ErrorInfo {
-	ssaFn := a.findSSAFunction(fn)
+func (a *Analyzer) TraceReturnStatements(fn *types.Func, errorPositions []int) []facts.ErrorInfo {
+	ssaFn := a.FindSSAFunction(fn)
 	if ssaFn == nil {
 		return nil
 	}
 
-	var errs []ErrorInfo
+	var errs []facts.ErrorInfo
 	visited := make(map[ssa.Value]bool)
 
 	// Iterate through all blocks and find Return instructions
@@ -85,13 +88,13 @@ const maxTraceDepth = 10
 // - Extract (multi-return value)
 // - Global variables that are errors
 // - MakeInterface with known custom error types
-func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bool, depth int) []ErrorInfo {
+func (a *Analyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
 	if val == nil || visited[val] || depth > maxTraceDepth {
 		return nil
 	}
 	visited[val] = true
 
-	var errs []ErrorInfo
+	var errs []facts.ErrorInfo
 
 	switch v := val.(type) {
 	case *ssa.Call:
@@ -156,10 +159,10 @@ func (a *ssaAnalyzer) traceValueToErrors(val ssa.Value, visited map[ssa.Value]bo
 }
 
 // filterIgnoredPackages removes errors from ignored packages.
-func (a *ssaAnalyzer) filterIgnoredPackages(errs []ErrorInfo) []ErrorInfo {
-	var filtered []ErrorInfo
+func (a *Analyzer) filterIgnoredPackages(errs []facts.ErrorInfo) []facts.ErrorInfo {
+	var filtered []facts.ErrorInfo
 	for _, s := range errs {
-		if !shouldIgnorePackage(s.PkgPath) {
+		if !internal.ShouldIgnorePackage(s.PkgPath) {
 			filtered = append(filtered, s)
 		}
 	}
@@ -168,13 +171,13 @@ func (a *ssaAnalyzer) filterIgnoredPackages(errs []ErrorInfo) []ErrorInfo {
 
 // getErrorsFromCall extracts error information from a function call.
 // Only returns errors if the called function has FunctionErrorsFact.
-func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
+func (a *Analyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
 	// Check for interface method call (invoke mode)
 	if call.Call.IsInvoke() {
 		return a.getErrorsFromInvoke(call, visited, depth)
 	}
 
-	var errs []ErrorInfo
+	var errs []facts.ErrorInfo
 
 	callee := call.Call.StaticCallee()
 	if callee == nil {
@@ -192,22 +195,22 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bo
 	}
 
 	// Check local facts first (for same-package functions)
-	if localFact, ok := a.localFacts[typesFunc]; ok {
+	if localFact, ok := a.LocalFacts[typesFunc]; ok {
 		errs = append(errs, localFact.Errors...)
 	}
 
 	// Also check imported facts (for cross-package or already exported)
-	var fnFact FunctionErrorsFact
+	var fnFact facts.FunctionErrorsFact
 	if a.pass.ImportObjectFact(typesFunc, &fnFact) {
 		errs = append(errs, fnFact.Errors...)
 	}
 
 	// Also resolve errors through ParameterFlowFact for static calls
-	var flowFact *ParameterFlowFact
-	if localPF, ok := a.localParamFlowFacts[typesFunc]; ok {
+	var flowFact *facts.ParameterFlowFact
+	if localPF, ok := a.LocalParamFlowFacts[typesFunc]; ok {
 		flowFact = localPF
 	}
-	var importedPF ParameterFlowFact
+	var importedPF facts.ParameterFlowFact
 	if a.pass.ImportObjectFact(typesFunc, &importedPF) {
 		if flowFact == nil {
 			flowFact = &importedPF
@@ -224,23 +227,23 @@ func (a *ssaAnalyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bo
 // getErrorsFromInvoke extracts error information from an interface method call.
 // It collects errors from all known implementations of the interface method,
 // and also resolves ParameterFlowFact to trace errors through parameters.
-func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
+func (a *Analyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
 	ifaceMethod := call.Call.Method
 	if ifaceMethod == nil {
 		return nil
 	}
 
-	var allErrors []ErrorInfo
+	var allErrors []facts.ErrorInfo
 
 	// Check InterfaceMethodFact for this method
-	var ifaceFact InterfaceMethodFact
+	var ifaceFact facts.InterfaceMethodFact
 	hasIfaceFact := a.pass.ImportObjectFact(ifaceMethod, &ifaceFact)
 	if hasIfaceFact {
 		allErrors = append(allErrors, ifaceFact.Errors...)
 	}
 
 	// Check ParameterFlowFact on the interface method (exported as intersection of impls)
-	var flowFact ParameterFlowFact
+	var flowFact facts.ParameterFlowFact
 	if a.pass.ImportObjectFact(ifaceMethod, &flowFact) {
 		paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, &flowFact, visited, depth)
 		allErrors = append(allErrors, paramFlowErrs...)
@@ -251,24 +254,24 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]
 	}
 
 	// Fallback: Get the interface type and scan implementations
-	ifaceType := getInterfaceType(call.Call.Value.Type())
+	ifaceType := internal.GetInterfaceType(call.Call.Value.Type())
 	if ifaceType == nil {
 		return a.deduplicateErrors(allErrors)
 	}
 
 	// Find all implementations and collect their errors
-	implementingTypes := a.interfaceImpls.getImplementingTypes(ifaceType)
+	implementingTypes := a.InterfaceImpls.GetImplementingTypes(ifaceType)
 	for _, concreteType := range implementingTypes {
-		method := findMethodImplementation(concreteType, ifaceMethod)
+		method := internal.FindMethodImplementation(concreteType, ifaceMethod)
 		if method == nil {
 			continue
 		}
 
 		// FunctionErrorsFact
-		if localFact, ok := a.localFacts[method]; ok {
+		if localFact, ok := a.LocalFacts[method]; ok {
 			allErrors = append(allErrors, localFact.Errors...)
 		}
-		var fnFact FunctionErrorsFact
+		var fnFact facts.FunctionErrorsFact
 		if a.pass.ImportObjectFact(method, &fnFact) {
 			allErrors = append(allErrors, fnFact.Errors...)
 		}
@@ -276,17 +279,17 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]
 
 	// If no ParameterFlowFact was found on the interface method, compute intersection from impls
 	if !a.pass.ImportObjectFact(ifaceMethod, &flowFact) && len(implementingTypes) > 0 {
-		var implFlowFacts []*ParameterFlowFact
+		var implFlowFacts []*facts.ParameterFlowFact
 		for _, concreteType := range implementingTypes {
-			method := findMethodImplementation(concreteType, ifaceMethod)
+			method := internal.FindMethodImplementation(concreteType, ifaceMethod)
 			if method == nil {
 				continue
 			}
-			var pf *ParameterFlowFact
-			if localPF, ok := a.localParamFlowFacts[method]; ok {
+			var pf *facts.ParameterFlowFact
+			if localPF, ok := a.LocalParamFlowFacts[method]; ok {
 				pf = localPF
 			}
-			var importedPF ParameterFlowFact
+			var importedPF facts.ParameterFlowFact
 			if a.pass.ImportObjectFact(method, &importedPF) {
 				if pf == nil {
 					pf = &importedPF
@@ -296,7 +299,7 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]
 			}
 			implFlowFacts = append(implFlowFacts, pf)
 		}
-		intersected := intersectParameterFlowFacts(implFlowFacts)
+		intersected := facts.IntersectParameterFlowFacts(implFlowFacts)
 		if intersected != nil {
 			paramFlowErrs := a.resolveParameterFlowErrorsForInvoke(call, intersected, visited, depth)
 			allErrors = append(allErrors, paramFlowErrs...)
@@ -309,8 +312,8 @@ func (a *ssaAnalyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]
 // resolveParameterFlowErrorsForInvoke resolves concrete errors passed as arguments
 // to an interface method call (invoke mode) based on ParameterFlowFact.
 // In invoke mode, call.Call.Args contains only method arguments (no receiver).
-func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFact *ParameterFlowFact, visited map[ssa.Value]bool, depth int) []ErrorInfo {
-	var errs []ErrorInfo
+func (a *Analyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFact *facts.ParameterFlowFact, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 	args := call.Call.Args
 
 	for _, flow := range flowFact.Flows {
@@ -334,8 +337,8 @@ func (a *ssaAnalyzer) resolveParameterFlowErrorsForInvoke(call *ssa.Call, flowFa
 // resolveParameterFlowErrorsForStaticCall resolves concrete errors passed as arguments
 // to a static function/method call based on ParameterFlowFact.
 // For method calls, args[0] is the receiver, so ParamIndex must be offset by 1.
-func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowFact *ParameterFlowFact, callee *ssa.Function, visited map[ssa.Value]bool, depth int) []ErrorInfo {
-	var errs []ErrorInfo
+func (a *Analyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowFact *facts.ParameterFlowFact, callee *ssa.Function, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 	args := call.Call.Args
 
 	// For methods, SSA args include the receiver at index 0
@@ -365,14 +368,14 @@ func (a *ssaAnalyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, fl
 
 // getErrorsFromMakeInterface checks if a MakeInterface creates a known custom error type.
 // Only returns errors if the type is explicitly registered as a error type.
-func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorInfo {
-	var errs []ErrorInfo
+func (a *Analyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	// Get the concrete type being converted to interface
 	concreteType := v.X.Type()
 
 	// Extract the named type (handling pointers)
-	namedType := extractNamedType(concreteType)
+	namedType := internal.ExtractNamedType(concreteType)
 	if namedType == nil {
 		return nil
 	}
@@ -389,14 +392,14 @@ func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorIn
 	}
 
 	// Skip ignored packages
-	if shouldIgnorePackage(pkg.Path()) {
+	if internal.ShouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
 	// Check if it's a local custom error type (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.localErrs.types[typeName] {
-			errs = append(errs, ErrorInfo{
+		if a.LocalErrs.Types[typeName] {
+			errs = append(errs, facts.ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    typeName.Name(),
 				Wrapped: false,
@@ -406,9 +409,9 @@ func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorIn
 	}
 
 	// For imported types, only use if they have an explicit fact
-	var errorFact ErrorFact
+	var errorFact facts.ErrorFact
 	if a.pass.ImportObjectFact(typeName, &errorFact) {
-		errs = append(errs, ErrorInfo{
+		errs = append(errs, facts.ErrorInfo{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
 			Wrapped: false,
@@ -419,8 +422,8 @@ func (a *ssaAnalyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []ErrorIn
 }
 
 // getErrorsFromAlloc checks if an Alloc creates a known custom error type.
-func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
-	var errs []ErrorInfo
+func (a *Analyzer) getErrorsFromAlloc(v *ssa.Alloc) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	allocType := v.Type()
 	// Alloc returns a pointer
@@ -429,7 +432,7 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 		return nil
 	}
 
-	namedType := extractNamedType(ptrType.Elem())
+	namedType := internal.ExtractNamedType(ptrType.Elem())
 	if namedType == nil {
 		return nil
 	}
@@ -446,14 +449,14 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 	}
 
 	// Skip ignored packages
-	if shouldIgnorePackage(pkg.Path()) {
+	if internal.ShouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
 	// Check if it's a local custom error type (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.localErrs.types[typeName] {
-			errs = append(errs, ErrorInfo{
+		if a.LocalErrs.Types[typeName] {
+			errs = append(errs, facts.ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    typeName.Name(),
 				Wrapped: false,
@@ -463,9 +466,9 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 	}
 
 	// For imported types, only use if they have an explicit fact
-	var errorFact ErrorFact
+	var errorFact facts.ErrorFact
 	if a.pass.ImportObjectFact(typeName, &errorFact) {
-		errs = append(errs, ErrorInfo{
+		errs = append(errs, facts.ErrorInfo{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
 			Wrapped: false,
@@ -476,8 +479,8 @@ func (a *ssaAnalyzer) getErrorsFromAlloc(v *ssa.Alloc) []ErrorInfo {
 }
 
 // getErrorsFromGlobal checks if a Global is a known error error.
-func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
-	var errs []ErrorInfo
+func (a *Analyzer) getErrorsFromGlobal(v *ssa.Global) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	obj := v.Object()
 	if obj == nil {
@@ -496,14 +499,14 @@ func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
 	}
 
 	// Skip ignored packages
-	if shouldIgnorePackage(pkg.Path()) {
+	if internal.ShouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
 
 	// Check if it's a local error (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.localErrs.vars[varObj] {
-			errs = append(errs, ErrorInfo{
+		if a.LocalErrs.Vars[varObj] {
+			errs = append(errs, facts.ErrorInfo{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    varObj.Name(),
 				Wrapped: false,
@@ -513,9 +516,9 @@ func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
 	}
 
 	// For imported variables, only use if they have an explicit fact
-	var errorFact ErrorFact
+	var errorFact facts.ErrorFact
 	if a.pass.ImportObjectFact(varObj, &errorFact) {
-		errs = append(errs, ErrorInfo{
+		errs = append(errs, facts.ErrorInfo{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
 			Wrapped: false,
@@ -526,9 +529,9 @@ func (a *ssaAnalyzer) getErrorsFromGlobal(v *ssa.Global) []ErrorInfo {
 }
 
 // deduplicateErrors removes duplicate errors from the list.
-func (a *ssaAnalyzer) deduplicateErrors(errs []ErrorInfo) []ErrorInfo {
+func (a *Analyzer) deduplicateErrors(errs []facts.ErrorInfo) []facts.ErrorInfo {
 	seen := make(map[string]bool)
-	var result []ErrorInfo
+	var result []facts.ErrorInfo
 	for _, s := range errs {
 		key := s.Key()
 		if !seen[key] {
@@ -540,7 +543,7 @@ func (a *ssaAnalyzer) deduplicateErrors(errs []ErrorInfo) []ErrorInfo {
 }
 
 // resolveParameterFlowErrors resolves concrete errors passed to functions with ParameterFlowFact.
-func (a *ssaAnalyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa.Value]bool, depth int) []ErrorInfo {
+func (a *Analyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
 	callee := call.Call.StaticCallee()
 	if callee == nil {
 		return nil
@@ -557,17 +560,17 @@ func (a *ssaAnalyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa
 	}
 
 	// Check for ParameterFlowFact
-	var flowFact *ParameterFlowFact
+	var flowFact *facts.ParameterFlowFact
 	hasFlowFact := false
 
 	// Check local facts first
-	if localFlowFact, ok := a.localParamFlowFacts[typesFunc]; ok {
+	if localFlowFact, ok := a.LocalParamFlowFacts[typesFunc]; ok {
 		flowFact = localFlowFact
 		hasFlowFact = true
 	}
 
 	// Also check imported facts
-	var importedFlowFact ParameterFlowFact
+	var importedFlowFact facts.ParameterFlowFact
 	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
 		if flowFact == nil {
 			flowFact = &importedFlowFact
@@ -581,7 +584,7 @@ func (a *ssaAnalyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa
 		return nil
 	}
 
-	var errs []ErrorInfo
+	var errs []facts.ErrorInfo
 	args := call.Call.Args
 
 	for _, flow := range flowFact.Flows {
@@ -606,10 +609,10 @@ func (a *ssaAnalyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa
 	return errs
 }
 
-// detectParameterFlow analyzes a function to determine which error parameters
+// DetectParameterFlow analyzes a function to determine which error parameters
 // flow to return values.
-func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) *ParameterFlowFact {
-	ssaFn := a.findSSAFunction(fn)
+func (a *Analyzer) DetectParameterFlow(fn *types.Func, errorPositions []int) *facts.ParameterFlowFact {
+	ssaFn := a.FindSSAFunction(fn)
 	if ssaFn == nil {
 		return nil
 	}
@@ -628,7 +631,7 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 		receiverOffset = 1
 	}
 
-	fact := &ParameterFlowFact{}
+	fact := &facts.ParameterFlowFact{}
 
 	// For each return statement, trace which parameters reach it
 	for _, block := range ssaFn.Blocks {
@@ -647,7 +650,7 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 						if adjustedIndex < 0 {
 							continue
 						}
-						adjustedFlow := ParameterFlowInfo{
+						adjustedFlow := facts.ParameterFlowInfo{
 							ParamIndex: adjustedIndex,
 							Wrapped:    flow.Wrapped,
 						}
@@ -664,11 +667,11 @@ func (a *ssaAnalyzer) detectParameterFlow(fn *types.Func, errorPositions []int) 
 	return fact
 }
 
-// detectFunctionParamCallFlow analyzes a function to determine which function-typed
+// DetectFunctionParamCallFlow analyzes a function to determine which function-typed
 // parameters are called and their results flow to the error return.
 // Example: func RunInTx(fn func() error) error { return fn() }
-func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions []int) *FunctionParamCallFlowFact {
-	ssaFn := a.findSSAFunction(fn)
+func (a *Analyzer) DetectFunctionParamCallFlow(fn *types.Func, errorPositions []int) *facts.FunctionParamCallFlowFact {
+	ssaFn := a.FindSSAFunction(fn)
 	if ssaFn == nil {
 		return nil
 	}
@@ -681,7 +684,7 @@ func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions
 		receiverOffset = 1
 	}
 
-	fact := &FunctionParamCallFlowFact{}
+	fact := &facts.FunctionParamCallFlowFact{}
 
 	// For each return statement, trace if the return value comes from calling a function parameter
 	for _, block := range ssaFn.Blocks {
@@ -700,7 +703,7 @@ func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions
 						if adjustedIndex < 0 {
 							continue
 						}
-						adjustedFlow := FunctionParamCallFlowInfo{
+						adjustedFlow := facts.FunctionParamCallFlowInfo{
 							ParamIndex: adjustedIndex,
 							Wrapped:    flow.Wrapped,
 						}
@@ -719,13 +722,13 @@ func (a *ssaAnalyzer) detectFunctionParamCallFlow(fn *types.Func, errorPositions
 
 // traceValueToFunctionParamCalls traces an SSA value to find if it comes from
 // calling a function-typed parameter.
-func (a *ssaAnalyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []FunctionParamCallFlowInfo {
+func (a *Analyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.FunctionParamCallFlowInfo {
 	if val == nil || visited[val] || depth > maxTraceDepth {
 		return nil
 	}
 	visited[val] = true
 
-	var flows []FunctionParamCallFlowInfo
+	var flows []facts.FunctionParamCallFlowInfo
 
 	switch v := val.(type) {
 	case *ssa.Call:
@@ -734,7 +737,7 @@ func (a *ssaAnalyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ss
 			// Find the parameter index
 			for i, p := range params {
 				if p == param {
-					flows = append(flows, FunctionParamCallFlowInfo{
+					flows = append(flows, facts.FunctionParamCallFlowInfo{
 						ParamIndex: i,
 						Wrapped:    false,
 					})
@@ -769,13 +772,13 @@ func (a *ssaAnalyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ss
 }
 
 // analyzeErrorfWrappingForFunctionParamCalls checks if fmt.Errorf wraps the result of a function parameter call
-func (a *ssaAnalyzer) analyzeErrorfWrappingForFunctionParamCalls(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []FunctionParamCallFlowInfo {
+func (a *Analyzer) analyzeErrorfWrappingForFunctionParamCalls(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.FunctionParamCallFlowInfo {
 	variadicArgs, wrapIndices := getWrappedArgIndices(call)
 	if len(wrapIndices) == 0 {
 		return nil
 	}
 
-	var flows []FunctionParamCallFlowInfo
+	var flows []facts.FunctionParamCallFlowInfo
 	for _, wrapIdx := range wrapIndices {
 		if wrapIdx >= len(variadicArgs) {
 			continue
@@ -792,9 +795,9 @@ func (a *ssaAnalyzer) analyzeErrorfWrappingForFunctionParamCalls(call *ssa.Call,
 }
 
 // deduplicateFunctionParamCallFlows removes duplicate function parameter call flows.
-func deduplicateFunctionParamCallFlows(flows []FunctionParamCallFlowInfo) []FunctionParamCallFlowInfo {
+func deduplicateFunctionParamCallFlows(flows []facts.FunctionParamCallFlowInfo) []facts.FunctionParamCallFlowInfo {
 	seen := make(map[int]bool)
-	var result []FunctionParamCallFlowInfo
+	var result []facts.FunctionParamCallFlowInfo
 	for _, flow := range flows {
 		if !seen[flow.ParamIndex] {
 			seen[flow.ParamIndex] = true
@@ -806,20 +809,20 @@ func deduplicateFunctionParamCallFlows(flows []FunctionParamCallFlowInfo) []Func
 
 // traceValueToParameters traces an SSA value back to see if it originates from parameters.
 // Returns a list of ParameterFlowInfo for any parameters that flow to this value.
-func (a *ssaAnalyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+func (a *Analyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.ParameterFlowInfo {
 	if val == nil || visited[val] || depth > maxTraceDepth {
 		return nil
 	}
 	visited[val] = true
 
-	var flows []ParameterFlowInfo
+	var flows []facts.ParameterFlowInfo
 
 	switch v := val.(type) {
 	case *ssa.Parameter:
 		// Found a parameter - check if it's an error type
 		for i, param := range params {
-			if param == v && isErrorType(param.Type()) {
-				flows = append(flows, ParameterFlowInfo{
+			if param == v && internal.IsErrorType(param.Type()) {
+				flows = append(flows, facts.ParameterFlowInfo{
 					ParamIndex: i,
 					Wrapped:    false,
 				})
@@ -861,7 +864,7 @@ func (a *ssaAnalyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parame
 }
 
 // traceTransitiveParameterFlow handles wrappers that call other wrappers.
-func (a *ssaAnalyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+func (a *Analyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.ParameterFlowInfo {
 	callee := call.Call.StaticCallee()
 	if callee == nil {
 		return nil
@@ -878,11 +881,11 @@ func (a *ssaAnalyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa
 	}
 
 	// Get ParameterFlowFact for the called function
-	var flowFact *ParameterFlowFact
-	if localFlowFact, ok := a.localParamFlowFacts[typesFunc]; ok {
+	var flowFact *facts.ParameterFlowFact
+	if localFlowFact, ok := a.LocalParamFlowFacts[typesFunc]; ok {
 		flowFact = localFlowFact
 	}
-	var importedFlowFact ParameterFlowFact
+	var importedFlowFact facts.ParameterFlowFact
 	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
 		if flowFact == nil {
 			flowFact = &importedFlowFact
@@ -893,7 +896,7 @@ func (a *ssaAnalyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa
 		return nil
 	}
 
-	var flows []ParameterFlowInfo
+	var flows []facts.ParameterFlowInfo
 	args := call.Call.Args
 
 	for _, flow := range flowFact.Flows {
@@ -936,7 +939,7 @@ func getWrappedArgIndices(call *ssa.Call) (variadicArgs []ssa.Value, wrapIndices
 		return nil, nil
 	}
 
-	wrapIndices = findWrapVerbIndices(formatStr)
+	wrapIndices = internal.FindWrapVerbIndices(formatStr)
 	if len(wrapIndices) == 0 {
 		return nil, nil
 	}
@@ -953,13 +956,13 @@ func getWrappedArgIndices(call *ssa.Call) (variadicArgs []ssa.Value, wrapIndices
 }
 
 // analyzeErrorfWrapping analyzes fmt.Errorf calls for %w verbs that wrap parameters
-func (a *ssaAnalyzer) analyzeErrorfWrapping(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []ParameterFlowInfo {
+func (a *Analyzer) analyzeErrorfWrapping(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.ParameterFlowInfo {
 	variadicArgs, wrapIndices := getWrappedArgIndices(call)
 	if len(wrapIndices) == 0 {
 		return nil
 	}
 
-	var flows []ParameterFlowInfo
+	var flows []facts.ParameterFlowInfo
 	for _, wrapIdx := range wrapIndices {
 		if wrapIdx >= len(variadicArgs) {
 			continue
@@ -1042,7 +1045,7 @@ func findErrorParamIndices(sig *types.Signature) []int {
 	var indices []int
 	params := sig.Params()
 	for i := 0; i < params.Len(); i++ {
-		if isErrorType(params.At(i).Type()) {
+		if internal.IsErrorType(params.At(i).Type()) {
 			indices = append(indices, i)
 		}
 	}
@@ -1050,9 +1053,9 @@ func findErrorParamIndices(sig *types.Signature) []int {
 }
 
 // deduplicateFlows removes duplicate parameter flows.
-func deduplicateFlows(flows []ParameterFlowInfo) []ParameterFlowInfo {
+func deduplicateFlows(flows []facts.ParameterFlowInfo) []facts.ParameterFlowInfo {
 	seen := make(map[int]bool)
-	var result []ParameterFlowInfo
+	var result []facts.ParameterFlowInfo
 	for _, flow := range flows {
 		if !seen[flow.ParamIndex] {
 			seen[flow.ParamIndex] = true

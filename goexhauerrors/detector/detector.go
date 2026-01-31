@@ -1,4 +1,4 @@
-package goexhauerrors
+package detector
 
 import (
 	"go/ast"
@@ -6,17 +6,34 @@ import (
 	"go/types"
 	"strings"
 
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/facts"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/internal"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 )
 
-// detectLocalErrors finds local errors in the current package and exports facts.
+// LocalErrors holds local error information for the current package.
+type LocalErrors struct {
+	// Vars maps *types.Var to true for error variables defined with errors.New() or fmt.Errorf()
+	Vars map[*types.Var]bool
+	// Types maps *types.TypeName to true for custom error types
+	Types map[*types.TypeName]bool
+}
+
+func NewLocalErrors() *LocalErrors {
+	return &LocalErrors{
+		Vars:  make(map[*types.Var]bool),
+		Types: make(map[*types.TypeName]bool),
+	}
+}
+
+// DetectLocalErrors finds local errors in the current package and exports facts.
 // It detects:
 // 1. var Err* = errors.New("...") pattern (sentinel errors)
 // 2. Custom error types (structs implementing error interface)
-func detectLocalErrors(pass *analysis.Pass) *localErrors {
-	result := newLocalErrors()
+func DetectLocalErrors(pass *analysis.Pass) *LocalErrors {
+	result := NewLocalErrors()
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -30,7 +47,7 @@ func detectLocalErrors(pass *analysis.Pass) *localErrors {
 }
 
 // detectSentinelVars finds var Err* = errors.New("...") patterns.
-func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *localErrors) {
+func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *LocalErrors) {
 	nodeFilter := []ast.Node{
 		(*ast.GenDecl)(nil),
 	}
@@ -60,17 +77,17 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 				}
 
 				// Check if type is error
-				if !isErrorType(varObj.Type()) {
+				if !internal.IsErrorType(varObj.Type()) {
 					continue
 				}
 
 				// Check initialization pattern
 				if i < len(valueSpec.Values) {
 					if isSentinelInit(pass, valueSpec.Values[i]) {
-						result.vars[varObj] = true
+						result.Vars[varObj] = true
 						// Only export fact for exported errors (cross-package analysis)
 						if token.IsExported(name.Name) {
-							fact := &ErrorFact{
+							fact := &facts.ErrorFact{
 								Name:    name.Name,
 								PkgPath: pass.Pkg.Path(),
 							}
@@ -84,7 +101,7 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 }
 
 // detectCustomErrorTypes finds struct types that implement the error interface.
-func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
+func detectCustomErrorTypes(pass *analysis.Pass, result *LocalErrors) {
 	errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
 
 	scope := pass.Pkg.Scope()
@@ -109,10 +126,10 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 				continue
 			}
 
-			result.types[typeName] = true
+			result.Types[typeName] = true
 			// Only export fact for exported types (cross-package analysis)
 			if token.IsExported(name) {
-				fact := &ErrorFact{
+				fact := &facts.ErrorFact{
 					Name:    typeName.Name(),
 					PkgPath: pass.Pkg.Path(),
 				}
@@ -120,22 +137,6 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *localErrors) {
 			}
 		}
 	}
-}
-
-// isErrorType checks if the given type is the error interface.
-func isErrorType(t types.Type) bool {
-	// Check if it's exactly the error interface
-	if named, ok := t.(*types.Named); ok {
-		if named.Obj().Pkg() == nil && named.Obj().Name() == "error" {
-			return true
-		}
-	}
-	// Check if it's an interface that matches error
-	if iface, ok := t.Underlying().(*types.Interface); ok {
-		errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
-		return types.Identical(iface, errorInterface)
-	}
-	return false
 }
 
 // isSentinelInit checks if the expression is a sentinel error initialization.
@@ -217,29 +218,10 @@ func isFmtErrorfWithoutWrap(pass *analysis.Pass, call *ast.CallExpr) bool {
 		return true
 	}
 
-	formatStr := extractStringLiteral(call.Args[0])
+	formatStr := internal.ExtractStringLiteral(call.Args[0])
 	if formatStr == "" {
 		return true // Can't determine, assume no %w
 	}
 
 	return !strings.Contains(formatStr, "%w")
-}
-
-// extractStringLiteral extracts the string value from a basic literal.
-func extractStringLiteral(expr ast.Expr) string {
-	lit, ok := expr.(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
-		return ""
-	}
-	// Remove quotes
-	s := lit.Value
-	if len(s) >= 2 {
-		if s[0] == '"' && s[len(s)-1] == '"' {
-			return s[1 : len(s)-1]
-		}
-		if s[0] == '`' && s[len(s)-1] == '`' {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
 }

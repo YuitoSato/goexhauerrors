@@ -1,4 +1,4 @@
-package goexhauerrors
+package facts
 
 import "encoding/gob"
 
@@ -325,10 +325,10 @@ func (f *ParameterCheckedErrorsFact) GetCheckedErrors(paramIndex int) []ErrorInf
 	return nil
 }
 
-// intersectParameterFlowFacts computes the intersection of ParameterFlowFact across implementations.
+// IntersectParameterFlowFacts computes the intersection of ParameterFlowFact across implementations.
 // A parameter flow is kept only if it exists in ALL non-nil facts.
 // If any fact is nil (implementation has no flow), the intersection is empty.
-func intersectParameterFlowFacts(facts []*ParameterFlowFact) *ParameterFlowFact {
+func IntersectParameterFlowFacts(facts []*ParameterFlowFact) *ParameterFlowFact {
 	if len(facts) == 0 {
 		return nil
 	}
@@ -361,10 +361,10 @@ func intersectParameterFlowFacts(facts []*ParameterFlowFact) *ParameterFlowFact 
 	return result
 }
 
-// intersectParameterCheckedErrorsFacts computes the intersection of ParameterCheckedErrorsFact across implementations.
+// IntersectParameterCheckedErrorsFacts computes the intersection of ParameterCheckedErrorsFact across implementations.
 // An error check is kept only if it exists in ALL non-nil facts.
 // If any fact is nil, the intersection is empty.
-func intersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *ParameterCheckedErrorsFact {
+func IntersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *ParameterCheckedErrorsFact {
 	if len(facts) == 0 {
 		return nil
 	}
@@ -383,7 +383,7 @@ func intersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *
 			checkedInAll := true
 			for _, other := range facts[1:] {
 				otherChecked := other.GetCheckedErrors(check.ParamIndex)
-				if !containsErrorInfo(otherChecked, errInfo) {
+				if !ContainsErrorInfo(otherChecked, errInfo) {
 					checkedInAll = false
 					break
 				}
@@ -400,8 +400,8 @@ func intersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *
 	return result
 }
 
-// containsErrorInfo checks if a slice of ErrorInfo contains the given error.
-func containsErrorInfo(infos []ErrorInfo, target ErrorInfo) bool {
+// ContainsErrorInfo checks if a slice of ErrorInfo contains the given error.
+func ContainsErrorInfo(infos []ErrorInfo, target ErrorInfo) bool {
 	key := target.Key()
 	for _, info := range infos {
 		if info.Key() == key {
