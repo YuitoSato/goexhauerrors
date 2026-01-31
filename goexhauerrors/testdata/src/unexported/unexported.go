@@ -2,14 +2,14 @@ package unexported
 
 import "errors"
 
-// Unexported sentinel errors - should NOT be detected
+// Unexported sentinel errors - now tracked locally (but not exported as facts)
 var errInternal = errors.New("internal error")
 var errPrivate = errors.New("private error")
 
-// Exported sentinel error - should be detected
+// Exported sentinel error - detected and exported as fact
 var ErrPublic = errors.New("public error") // want ErrPublic:`unexported.ErrPublic`
 
-// Unexported custom error type - should NOT be detected
+// Unexported custom error type - now tracked locally (but not exported as fact)
 type internalError struct {
 	msg string
 }
@@ -18,7 +18,7 @@ func (e *internalError) Error() string {
 	return e.msg
 }
 
-// Exported custom error type - should be detected
+// Exported custom error type - detected and exported as fact
 type PublicError struct { // want PublicError:`unexported.PublicError`
 	Msg string
 }
@@ -35,8 +35,8 @@ func DoPublicWork() error { // want DoPublicWork:`\[unexported.ErrPublic, unexpo
 	return &PublicError{Msg: "public"}
 }
 
-// Function returning only unexported errors - no error facts expected
-func DoPrivateWork() error {
+// Function returning only unexported errors - now tracked locally
+func DoPrivateWork() error { // want DoPrivateWork:`\[unexported.errInternal, unexported.internalError\]`
 	if true {
 		return errInternal
 	}
@@ -44,12 +44,11 @@ func DoPrivateWork() error {
 }
 
 // Function returning mix of exported and unexported errors
-// Only exported errors should be in the fact
-func DoMixedWork() error { // want DoMixedWork:`\[unexported.ErrPublic\]`
+func DoMixedWork() error { // want DoMixedWork:`\[unexported.errPrivate, unexported.ErrPublic\]`
 	if true {
-		return errPrivate // unexported, not tracked
+		return errPrivate
 	}
-	return ErrPublic // exported, tracked
+	return ErrPublic
 }
 
 // Caller that properly handles exported errors - no warning
@@ -72,10 +71,41 @@ func BadCaller() {
 	}
 }
 
-// Caller of function with only unexported errors - no warning needed
+// Caller of function with unexported errors - now warns
 func PrivateCaller() {
-	err := DoPrivateWork()
+	err := DoPrivateWork() // want "missing errors.Is check for unexported.errInternal" "missing errors.Is check for unexported.internalError"
 	if err != nil {
 		println(err.Error())
+	}
+}
+
+// Caller that properly handles unexported errors
+func GoodPrivateCaller() {
+	err := DoPrivateWork()
+	if errors.Is(err, errInternal) {
+		println("internal error")
+	}
+	var intErr *internalError
+	if errors.As(err, &intErr) {
+		println("internal error type")
+	}
+}
+
+// MixedPartialCaller checks only the exported error in a mixed function
+func MixedPartialCaller() {
+	err := DoMixedWork() // want "missing errors.Is check for unexported.errPrivate"
+	if errors.Is(err, ErrPublic) {
+		println("public")
+	}
+}
+
+// MixedGoodCaller checks all errors (both exported and unexported) in a mixed function
+func MixedGoodCaller() {
+	err := DoMixedWork()
+	if errors.Is(err, errPrivate) {
+		println("private")
+	}
+	if errors.Is(err, ErrPublic) {
+		println("public")
 	}
 }

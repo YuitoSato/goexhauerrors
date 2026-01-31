@@ -32,6 +32,9 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgmethod/errors",
 		"crosspkgmethod/usecase",
 		"crosspkgmethod/presentation",
+		"deferselect",
+		"funclit",
+		"discard",
 	)
 }
 
