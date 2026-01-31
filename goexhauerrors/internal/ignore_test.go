@@ -1,4 +1,4 @@
-package goexhauerrors
+package internal
 
 import "testing"
 
@@ -22,14 +22,13 @@ func TestShouldIgnorePackage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Set global ignorePackages for this test
 			oldVal := ignorePackages
 			ignorePackages = tt.ignorePackagesVal
 			defer func() { ignorePackages = oldVal }()
 
-			got := shouldIgnorePackage(tt.pkgPath)
+			got := ShouldIgnorePackage(tt.pkgPath)
 			if got != tt.want {
-				t.Errorf("shouldIgnorePackage(%q) with ignorePackages=%q = %v, want %v",
+				t.Errorf("ShouldIgnorePackage(%q) with ignorePackages=%q = %v, want %v",
 					tt.pkgPath, tt.ignorePackagesVal, got, tt.want)
 			}
 		})

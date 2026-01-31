@@ -1,29 +1,34 @@
-package goexhauerrors
+package internal
 
 import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/inspect"
+	"golang.org/x/tools/go/ast/inspector"
 )
 
-// interfaceImplementations caches interface -> implementing types mapping.
-type interfaceImplementations struct {
+// InterfaceImplementations caches interface -> implementing types mapping.
+type InterfaceImplementations struct {
 	// implementations maps interface types to their implementing named types
 	implementations map[*types.Interface][]*types.Named
 }
 
-// newInterfaceImplementations creates a new interface implementations cache.
-func newInterfaceImplementations() *interfaceImplementations {
-	return &interfaceImplementations{
+// NewInterfaceImplementations creates a new interface implementations cache.
+func NewInterfaceImplementations() *InterfaceImplementations {
+	return &InterfaceImplementations{
 		implementations: make(map[*types.Interface][]*types.Named),
 	}
 }
 
-// findInterfaceImplementations discovers all interface implementations visible from the package.
+// FindInterfaceImplementations discovers all interface implementations visible from the package.
 // It scans named types in the current package and all directly imported packages,
 // and checks if they implement any interfaces also visible from the package.
-func findInterfaceImplementations(pass *analysis.Pass) *interfaceImplementations {
-	impl := newInterfaceImplementations()
+func FindInterfaceImplementations(pass *analysis.Pass) *InterfaceImplementations {
+	impl := NewInterfaceImplementations()
+
+	// Use inspector to ensure it's available (required dependency)
+	_ = pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// Collect interfaces from current package + imported packages
 	var interfaces []*types.Interface
@@ -89,14 +94,14 @@ func collectNamedTypes(scope *types.Scope, namedTypes *[]*types.Named) {
 	}
 }
 
-// getImplementingTypes returns all types that implement the given interface.
-func (impl *interfaceImplementations) getImplementingTypes(iface *types.Interface) []*types.Named {
+// GetImplementingTypes returns all types that implement the given interface.
+func (impl *InterfaceImplementations) GetImplementingTypes(iface *types.Interface) []*types.Named {
 	return impl.implementations[iface]
 }
 
-// findMethodImplementation finds the concrete method on a type that implements
+// FindMethodImplementation finds the concrete method on a type that implements
 // an interface method.
-func findMethodImplementation(concreteType *types.Named, ifaceMethod *types.Func) *types.Func {
+func FindMethodImplementation(concreteType *types.Named, ifaceMethod *types.Func) *types.Func {
 	methodName := ifaceMethod.Name()
 
 	// Check methods on the named type itself
@@ -120,8 +125,8 @@ func findMethodImplementation(concreteType *types.Named, ifaceMethod *types.Func
 	return nil
 }
 
-// getInterfaceType extracts the interface type from a type, handling pointers.
-func getInterfaceType(t types.Type) *types.Interface {
+// GetInterfaceType extracts the interface type from a type, handling pointers.
+func GetInterfaceType(t types.Type) *types.Interface {
 	switch typ := t.(type) {
 	case *types.Interface:
 		return typ
@@ -130,7 +135,7 @@ func getInterfaceType(t types.Type) *types.Interface {
 			return iface
 		}
 	case *types.Pointer:
-		return getInterfaceType(typ.Elem())
+		return GetInterfaceType(typ.Elem())
 	}
 	return nil
 }

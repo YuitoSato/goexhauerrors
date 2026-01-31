@@ -1,10 +1,13 @@
-package goexhauerrors
+package analyzer
 
 import (
 	"go/ast"
 	"go/types"
-	"strings"
 
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/detector"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/facts"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/internal"
+	ssaanalysis "github.com/YuitoSato/goexhauerrors/goexhauerrors/ssa"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
@@ -17,16 +20,16 @@ type funcInfo struct {
 	errorPositions []int
 }
 
-// analyzeFunctionReturns analyzes all functions in the package and exports
+// AnalyzeFunctionReturns analyzes all functions in the package and exports
 // FunctionErrorsFact for each function that can return errors.
 // It uses iterative analysis to handle factory functions that call other
 // functions returning errors, combined with SSA-based analysis to track
 // errors through variables.
-func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*types.Func]*FunctionErrorsFact, map[*types.Func]*ParameterFlowFact, *interfaceImplementations) {
+func AnalyzeFunctionReturns(pass *analysis.Pass, localErrs *detector.LocalErrors) (map[*types.Func]*facts.FunctionErrorsFact, map[*types.Func]*facts.ParameterFlowFact, *internal.InterfaceImplementations) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// Discover interface implementations in this package
-	interfaceImpls := findInterfaceImplementations(pass)
+	interfaceImpls := internal.FindInterfaceImplementations(pass)
 
 	// Collect all function declarations
 	var funcs []funcInfo
@@ -50,7 +53,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 		}
 
 		sig := fn.Type().(*types.Signature)
-		errorPositions := findErrorReturnPositions(sig)
+		errorPositions := internal.FindErrorReturnPositions(sig)
 		if len(errorPositions) == 0 {
 			return
 		}
@@ -63,20 +66,20 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 	})
 
 	// Track facts for local functions during iteration
-	localFacts := make(map[*types.Func]*FunctionErrorsFact)
-	localParamFlowFacts := make(map[*types.Func]*ParameterFlowFact)
-	localCallFlowFacts := make(map[*types.Func]*FunctionParamCallFlowFact)
+	localFacts := make(map[*types.Func]*facts.FunctionErrorsFact)
+	localParamFlowFacts := make(map[*types.Func]*facts.ParameterFlowFact)
+	localCallFlowFacts := make(map[*types.Func]*facts.FunctionParamCallFlowFact)
 
 	// Iterate until no new facts are discovered (AST-based + SSA-based analysis)
 	for {
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := newSSAAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
+		ssaAnalyzer := ssaanalysis.NewAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
 
 		for _, fi := range funcs {
 			// Phase A: Detect parameter flow (for error-typed parameters)
-			paramFlowFact := ssaAnalyzer.detectParameterFlow(fi.fn, fi.errorPositions)
+			paramFlowFact := ssaAnalyzer.DetectParameterFlow(fi.fn, fi.errorPositions)
 			if paramFlowFact != nil {
 				existingParamFlow := localParamFlowFacts[fi.fn]
 				if existingParamFlow == nil {
@@ -92,7 +95,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 			}
 
 			// Phase A2: Detect function parameter call flow (for function-typed parameters)
-			callFlowFact := ssaAnalyzer.detectFunctionParamCallFlow(fi.fn, fi.errorPositions)
+			callFlowFact := ssaAnalyzer.DetectFunctionParamCallFlow(fi.fn, fi.errorPositions)
 			if callFlowFact != nil {
 				existingCallFlow := localCallFlowFacts[fi.fn]
 				if existingCallFlow == nil {
@@ -108,13 +111,13 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 			}
 
 			// Phase B: Analyze errors (AST-based + SSA-based)
-			fact := &FunctionErrorsFact{}
+			fact := &facts.FunctionErrorsFact{}
 
 			// AST-based analysis
 			analyzeReturnsWithLocalFacts(pass, fi.body, fi.errorPositions, localErrs, fact, localFacts)
 
 			// SSA-based analysis to trace errors through variables
-			ssaErrors := ssaAnalyzer.traceReturnStatements(fi.fn, fi.errorPositions)
+			ssaErrors := ssaAnalyzer.TraceReturnStatements(fi.fn, fi.errorPositions)
 			for _, s := range ssaErrors {
 				fact.AddError(s)
 			}
@@ -165,7 +168,7 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 		}
 	}
 
-	// Return data needed for interface method facts (computed after analyzeParameterErrorChecks)
+	// Return data needed for interface method facts (computed after AnalyzeParameterErrorChecks)
 	return localFacts, localParamFlowFacts, interfaceImpls
 }
 
@@ -173,17 +176,17 @@ func analyzeFunctionReturns(pass *analysis.Pass, localErrs *localErrors) (map[*t
 // A error is valid if:
 // 1. It's a local error (var or type) in the current package
 // 2. It has an imported ErrorFact (excluding ignored packages)
-func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bool {
+func buildValidErrors(pass *analysis.Pass, localErrs *detector.LocalErrors) map[string]bool {
 	valid := make(map[string]bool)
 
 	// Add local error variables
-	for varObj := range localErrs.vars {
+	for varObj := range localErrs.Vars {
 		key := pass.Pkg.Path() + "." + varObj.Name()
 		valid[key] = true
 	}
 
 	// Add local custom error types
-	for typeName := range localErrs.types {
+	for typeName := range localErrs.Types {
 		key := pass.Pkg.Path() + "." + typeName.Name()
 		valid[key] = true
 	}
@@ -193,7 +196,7 @@ func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bo
 	// This is done by scanning all referenced packages for exported facts
 	for _, imp := range pass.Pkg.Imports() {
 		// Skip ignored packages
-		if shouldIgnorePackage(imp.Path()) {
+		if internal.ShouldIgnorePackage(imp.Path()) {
 			continue
 		}
 
@@ -202,14 +205,14 @@ func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bo
 			obj := scope.Lookup(name)
 			// Check for error variable facts
 			if varObj, ok := obj.(*types.Var); ok {
-				var errorFact ErrorFact
+				var errorFact facts.ErrorFact
 				if pass.ImportObjectFact(varObj, &errorFact) {
 					valid[errorFact.Key()] = true
 				}
 			}
 			// Check for error type facts
 			if typeName, ok := obj.(*types.TypeName); ok {
-				var errorFact ErrorFact
+				var errorFact facts.ErrorFact
 				if pass.ImportObjectFact(typeName, &errorFact) {
 					valid[errorFact.Key()] = true
 				}
@@ -221,7 +224,7 @@ func buildValidErrors(pass *analysis.Pass, localErrs *localErrors) map[string]bo
 }
 
 // analyzeReturnsWithLocalFacts is like analyzeReturns but also checks local function facts.
-func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *localErrors, fact *FunctionErrorsFact, localFacts map[*types.Func]*FunctionErrorsFact) {
+func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact, localFacts map[*types.Func]*facts.FunctionErrorsFact) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
@@ -239,7 +242,7 @@ func analyzeReturnsWithLocalFacts(pass *analysis.Pass, body *ast.BlockStmt, erro
 }
 
 // analyzeErrorExprWithLocalFacts is like analyzeErrorExpr but also checks local function facts.
-func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool, localFacts map[*types.Func]*FunctionErrorsFact) {
+func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact, wrapped bool, localFacts map[*types.Func]*facts.FunctionErrorsFact) {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		obj := pass.TypesInfo.Uses[e]
@@ -248,17 +251,17 @@ func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErr
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			if localErrs.vars[varObj] {
-				fact.AddError(ErrorInfo{
+			if localErrs.Vars[varObj] {
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: pass.Pkg.Path(),
 					Name:    varObj.Name(),
 					Wrapped: wrapped,
 				})
 				return
 			}
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				fact.AddError(ErrorInfo{
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: wrapped,
@@ -273,9 +276,9 @@ func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErr
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				fact.AddError(ErrorInfo{
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: wrapped,
@@ -284,25 +287,25 @@ func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErr
 		}
 
 	case *ast.CallExpr:
-		if isFmtErrorfCall(pass, e) {
+		if internal.IsFmtErrorfCall(pass, e) {
 			analyzeFmtErrorfCallWithLocalFacts(pass, e, localErrs, fact, localFacts)
 			return
 		}
 
-		if compLit := extractCompositeLit(e); compLit != nil {
+		if compLit := internal.ExtractCompositeLit(e); compLit != nil {
 			analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			return
 		}
 
 		// Check for function calls - first check local facts, then imported facts
-		calledFn := getCalledFunction(pass, e)
+		calledFn := internal.GetCalledFunction(pass, e)
 		if calledFn != nil {
 			// Check local facts first (for same-package functions)
 			if localFact, ok := localFacts[calledFn]; ok {
 				fact.Merge(localFact)
 			}
 			// Also check imported facts (for cross-package or already exported)
-			var fnFact FunctionErrorsFact
+			var fnFact facts.FunctionErrorsFact
 			if pass.ImportObjectFact(calledFn, &fnFact) {
 				fact.Merge(&fnFact)
 			}
@@ -321,17 +324,17 @@ func analyzeErrorExprWithLocalFacts(pass *analysis.Pass, expr ast.Expr, localErr
 }
 
 // analyzeFmtErrorfCallWithLocalFacts is like analyzeFmtErrorfCall but uses local facts.
-func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr, localErrs *localErrors, fact *FunctionErrorsFact, localFacts map[*types.Func]*FunctionErrorsFact) {
+func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact, localFacts map[*types.Func]*facts.FunctionErrorsFact) {
 	if len(call.Args) < 1 {
 		return
 	}
 
-	formatStr := extractStringLiteral(call.Args[0])
+	formatStr := internal.ExtractStringLiteral(call.Args[0])
 	if formatStr == "" {
 		return
 	}
 
-	wrapIndices := findWrapVerbIndices(formatStr)
+	wrapIndices := internal.FindWrapVerbIndices(formatStr)
 	if len(wrapIndices) == 0 {
 		return
 	}
@@ -345,20 +348,8 @@ func analyzeFmtErrorfCallWithLocalFacts(pass *analysis.Pass, call *ast.CallExpr,
 	}
 }
 
-// findErrorReturnPositions finds which return value positions are error type.
-func findErrorReturnPositions(sig *types.Signature) []int {
-	var positions []int
-	results := sig.Results()
-	for i := 0; i < results.Len(); i++ {
-		if isErrorType(results.At(i).Type()) {
-			positions = append(positions, i)
-		}
-	}
-	return positions
-}
-
 // analyzeReturns walks through the function body and analyzes return statements.
-func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *localErrors, fact *FunctionErrorsFact) {
+func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []int, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
@@ -377,7 +368,7 @@ func analyzeReturns(pass *analysis.Pass, body *ast.BlockStmt, errorPositions []i
 }
 
 // analyzeErrorExpr analyzes an expression to find errors.
-func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool) {
+func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact, wrapped bool) {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		// Direct error return: return ErrNotFound
@@ -388,8 +379,8 @@ func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors
 
 		if varObj, ok := obj.(*types.Var); ok {
 			// Check local errors
-			if localErrs.vars[varObj] {
-				fact.AddError(ErrorInfo{
+			if localErrs.Vars[varObj] {
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: pass.Pkg.Path(),
 					Name:    varObj.Name(),
 					Wrapped: wrapped,
@@ -397,9 +388,9 @@ func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors
 				return
 			}
 			// Check imported error via fact
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				fact.AddError(ErrorInfo{
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: wrapped,
@@ -415,9 +406,9 @@ func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors
 		}
 
 		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				fact.AddError(ErrorInfo{
+				fact.AddError(facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: wrapped,
@@ -427,21 +418,21 @@ func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors
 
 	case *ast.CallExpr:
 		// Check for fmt.Errorf with %w wrapping a error
-		if isFmtErrorfCall(pass, e) {
+		if internal.IsFmtErrorfCall(pass, e) {
 			analyzeFmtErrorfCall(pass, e, localErrs, fact)
 			return
 		}
 
 		// Check for custom error type construction: &MyError{} or MyError{}
-		if compLit := extractCompositeLit(e); compLit != nil {
+		if compLit := internal.ExtractCompositeLit(e); compLit != nil {
 			analyzeCompositeLit(pass, compLit, localErrs, fact, wrapped)
 			return
 		}
 
 		// Check for function calls that might return errors
-		calledFn := getCalledFunction(pass, e)
+		calledFn := internal.GetCalledFunction(pass, e)
 		if calledFn != nil {
-			var fnFact FunctionErrorsFact
+			var fnFact facts.FunctionErrorsFact
 			if pass.ImportObjectFact(calledFn, &fnFact) {
 				fact.Merge(&fnFact)
 			}
@@ -461,29 +452,15 @@ func analyzeErrorExpr(pass *analysis.Pass, expr ast.Expr, localErrs *localErrors
 	}
 }
 
-// extractCompositeLit extracts composite literal from &MyError{} pattern.
-func extractCompositeLit(call *ast.CallExpr) *ast.CompositeLit {
-	// This handles cases like (&MyError{}).SomeMethod()
-	// For now, we just check if the function itself is a composite lit
-	if unary, ok := call.Fun.(*ast.UnaryExpr); ok {
-		if unary.Op.String() == "&" {
-			if compLit, ok := unary.X.(*ast.CompositeLit); ok {
-				return compLit
-			}
-		}
-	}
-	return nil
-}
-
 // analyzeCompositeLit checks if a composite literal is a custom error type.
-func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localErrs *localErrors, fact *FunctionErrorsFact, wrapped bool) {
+func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact, wrapped bool) {
 	// Get the type of the composite literal
 	tv := pass.TypesInfo.Types[compLit]
 	if !tv.IsValue() {
 		return
 	}
 
-	namedType := extractNamedType(tv.Type)
+	namedType := internal.ExtractNamedType(tv.Type)
 	if namedType == nil {
 		return
 	}
@@ -491,8 +468,8 @@ func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localEr
 	typeName := namedType.Obj()
 
 	// Check local custom error types
-	if localErrs.types[typeName] {
-		fact.AddError(ErrorInfo{
+	if localErrs.Types[typeName] {
+		fact.AddError(facts.ErrorInfo{
 			PkgPath: pass.Pkg.Path(),
 			Name:    typeName.Name(),
 			Wrapped: wrapped,
@@ -501,9 +478,9 @@ func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localEr
 	}
 
 	// Check imported custom error types
-	var errorFact ErrorFact
+	var errorFact facts.ErrorFact
 	if pass.ImportObjectFact(typeName, &errorFact) {
-		fact.AddError(ErrorInfo{
+		fact.AddError(facts.ErrorInfo{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
 			Wrapped: wrapped,
@@ -511,57 +488,19 @@ func analyzeCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit, localEr
 	}
 }
 
-// extractNamedType extracts the named type from a type, handling pointers.
-func extractNamedType(t types.Type) *types.Named {
-	switch typ := t.(type) {
-	case *types.Named:
-		return typ
-	case *types.Pointer:
-		if named, ok := typ.Elem().(*types.Named); ok {
-			return named
-		}
-	}
-	return nil
-}
-
-// isFmtErrorfCall checks if the call is fmt.Errorf.
-func isFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-
-	if sel.Sel.Name != "Errorf" {
-		return false
-	}
-
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-
-	obj := pass.TypesInfo.Uses[ident]
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return false
-	}
-
-	return pkgName.Imported().Path() == "fmt"
-}
-
 // analyzeFmtErrorfCall analyzes fmt.Errorf calls for %w wrapped errors.
-func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, localErrs *localErrors, fact *FunctionErrorsFact) {
+func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, localErrs *detector.LocalErrors, fact *facts.FunctionErrorsFact) {
 	if len(call.Args) < 1 {
 		return
 	}
 
-	formatStr := extractStringLiteral(call.Args[0])
+	formatStr := internal.ExtractStringLiteral(call.Args[0])
 	if formatStr == "" {
 		return
 	}
 
 	// Find %w positions in format string
-	wrapIndices := findWrapVerbIndices(formatStr)
+	wrapIndices := internal.FindWrapVerbIndices(formatStr)
 	if len(wrapIndices) == 0 {
 		return
 	}
@@ -576,78 +515,9 @@ func analyzeFmtErrorfCall(pass *analysis.Pass, call *ast.CallExpr, localErrs *lo
 	}
 }
 
-// findWrapVerbIndices finds the argument indices for %w verbs in format string.
-func findWrapVerbIndices(format string) []int {
-	var indices []int
-	argIndex := 0
-
-	for i := 0; i < len(format); i++ {
-		if format[i] != '%' {
-			continue
-		}
-		if i+1 >= len(format) {
-			break
-		}
-		i++
-
-		// Skip flags
-		for i < len(format) && strings.ContainsRune("+-# 0", rune(format[i])) {
-			i++
-		}
-
-		// Skip width
-		for i < len(format) && format[i] >= '0' && format[i] <= '9' {
-			i++
-		}
-
-		// Skip precision
-		if i < len(format) && format[i] == '.' {
-			i++
-			for i < len(format) && format[i] >= '0' && format[i] <= '9' {
-				i++
-			}
-		}
-
-		if i >= len(format) {
-			break
-		}
-
-		verb := format[i]
-		if verb == '%' {
-			continue // %% doesn't consume argument
-		}
-
-		if verb == 'w' {
-			indices = append(indices, argIndex)
-		}
-		argIndex++
-	}
-
-	return indices
-}
-
-// getCalledFunction returns the *types.Func for a call expression if available.
-func getCalledFunction(pass *analysis.Pass, call *ast.CallExpr) *types.Func {
-	var obj types.Object
-
-	switch fun := call.Fun.(type) {
-	case *ast.Ident:
-		obj = pass.TypesInfo.Uses[fun]
-	case *ast.SelectorExpr:
-		obj = pass.TypesInfo.Uses[fun.Sel]
-	default:
-		return nil
-	}
-
-	if fn, ok := obj.(*types.Func); ok {
-		return fn
-	}
-	return nil
-}
-
-// analyzeClosures finds closures assigned to variables and exports facts for them.
+// AnalyzeClosures finds closures assigned to variables and exports facts for them.
 // This handles patterns like: handler := func() error { return ErrX }
-func analyzeClosures(pass *analysis.Pass, localErrs *localErrors) {
+func AnalyzeClosures(pass *analysis.Pass, localErrs *detector.LocalErrors) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
@@ -666,7 +536,7 @@ func analyzeClosures(pass *analysis.Pass, localErrs *localErrors) {
 }
 
 // analyzeClosureAssignment handles: handler := func() error { ... }
-func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localErrs *localErrors) {
+func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localErrs *detector.LocalErrors) {
 	for i, rhs := range stmt.Rhs {
 		funcLit, ok := rhs.(*ast.FuncLit)
 		if !ok {
@@ -675,7 +545,7 @@ func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localEr
 
 		// Check if the function literal returns error
 		sig := pass.TypesInfo.Types[funcLit].Type.(*types.Signature)
-		errorPositions := findErrorReturnPositions(sig)
+		errorPositions := internal.FindErrorReturnPositions(sig)
 		if len(errorPositions) == 0 {
 			continue
 		}
@@ -699,7 +569,7 @@ func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localEr
 		}
 
 		// Analyze the closure body for errors
-		fact := &FunctionErrorsFact{}
+		fact := &facts.FunctionErrorsFact{}
 		analyzeReturns(pass, funcLit.Body, errorPositions, localErrs, fact)
 
 		// Export fact attached to the variable
@@ -710,7 +580,7 @@ func analyzeClosureAssignment(pass *analysis.Pass, stmt *ast.AssignStmt, localEr
 }
 
 // analyzeClosureValueSpec handles: var handler = func() error { ... }
-func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs *localErrors) {
+func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs *detector.LocalErrors) {
 	for i, value := range spec.Values {
 		funcLit, ok := value.(*ast.FuncLit)
 		if !ok {
@@ -726,7 +596,7 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 		if !ok {
 			continue
 		}
-		errorPositions := findErrorReturnPositions(sig)
+		errorPositions := internal.FindErrorReturnPositions(sig)
 		if len(errorPositions) == 0 {
 			continue
 		}
@@ -747,7 +617,7 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 		}
 
 		// Analyze the closure body for errors
-		fact := &FunctionErrorsFact{}
+		fact := &facts.FunctionErrorsFact{}
 		analyzeReturns(pass, funcLit.Body, errorPositions, localErrs, fact)
 
 		// Export fact attached to the variable
@@ -757,12 +627,12 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 	}
 }
 
-// computeInterfaceMethodFacts computes and exports InterfaceMethodFact, ParameterFlowFact,
+// ComputeInterfaceMethodFacts computes and exports InterfaceMethodFact, ParameterFlowFact,
 // and ParameterCheckedErrorsFact for each interface method in the package.
 // It collects errors from all known implementations.
 // For ParameterFlowFact and ParameterCheckedErrorsFact, intersection semantics is used
 // (a fact is only exported if ALL implementations agree).
-func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*FunctionErrorsFact, localParamFlowFacts map[*types.Func]*ParameterFlowFact, impls *interfaceImplementations) {
+func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, impls *internal.InterfaceImplementations) {
 	scope := pass.Pkg.Scope()
 
 	// For each interface defined in this package
@@ -787,14 +657,14 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 				continue
 			}
 
-			fact := &InterfaceMethodFact{}
-			var allParamFlowFacts []*ParameterFlowFact
-			var allCheckedFacts []*ParameterCheckedErrorsFact
+			fact := &facts.InterfaceMethodFact{}
+			var allParamFlowFacts []*facts.ParameterFlowFact
+			var allCheckedFacts []*facts.ParameterCheckedErrorsFact
 
 			// Collect facts from all implementations
-			implementingTypes := impls.getImplementingTypes(ifaceType)
+			implementingTypes := impls.GetImplementingTypes(ifaceType)
 			for _, concreteType := range implementingTypes {
-				method := findMethodImplementation(concreteType, ifaceMethod)
+				method := internal.FindMethodImplementation(concreteType, ifaceMethod)
 				if method == nil {
 					continue
 				}
@@ -803,17 +673,17 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 				if localFact, ok := localFacts[method]; ok {
 					fact.AddErrors(localFact.Errors)
 				}
-				var fnFact FunctionErrorsFact
+				var fnFact facts.FunctionErrorsFact
 				if pass.ImportObjectFact(method, &fnFact) {
 					fact.AddErrors(fnFact.Errors)
 				}
 
 				// ParameterFlowFact (collect for intersection)
-				var pf *ParameterFlowFact
+				var pf *facts.ParameterFlowFact
 				if localPF, ok := localParamFlowFacts[method]; ok {
 					pf = localPF
 				}
-				var importedPF ParameterFlowFact
+				var importedPF facts.ParameterFlowFact
 				if pass.ImportObjectFact(method, &importedPF) {
 					if pf == nil {
 						pf = &importedPF
@@ -824,8 +694,8 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 				allParamFlowFacts = append(allParamFlowFacts, pf)
 
 				// ParameterCheckedErrorsFact (collect for intersection)
-				var cf *ParameterCheckedErrorsFact
-				var importedCF ParameterCheckedErrorsFact
+				var cf *facts.ParameterCheckedErrorsFact
+				var importedCF facts.ParameterCheckedErrorsFact
 				if pass.ImportObjectFact(method, &importedCF) {
 					cf = &importedCF
 				}
@@ -839,7 +709,7 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 
 			// Export ParameterFlowFact (intersection across implementations)
 			if len(allParamFlowFacts) > 0 {
-				intersectedFlow := intersectParameterFlowFacts(allParamFlowFacts)
+				intersectedFlow := facts.IntersectParameterFlowFacts(allParamFlowFacts)
 				if intersectedFlow != nil && len(intersectedFlow.Flows) > 0 {
 					pass.ExportObjectFact(ifaceMethod, intersectedFlow)
 				}
@@ -847,7 +717,7 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 
 			// Export ParameterCheckedErrorsFact (intersection across implementations)
 			if len(allCheckedFacts) > 0 {
-				intersectedChecked := intersectParameterCheckedErrorsFacts(allCheckedFacts)
+				intersectedChecked := facts.IntersectParameterCheckedErrorsFacts(allCheckedFacts)
 				if intersectedChecked != nil && len(intersectedChecked.Checks) > 0 {
 					pass.ExportObjectFact(ifaceMethod, intersectedChecked)
 				}
@@ -856,10 +726,10 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 	}
 }
 
-// analyzeParameterErrorChecks analyzes all functions to detect errors.Is/As checks
+// AnalyzeParameterErrorChecks analyzes all functions to detect errors.Is/As checks
 // performed on error-typed parameters inside the function body.
 // This allows callers to know which errors are already checked inside the function.
-func analyzeParameterErrorChecks(pass *analysis.Pass) {
+func AnalyzeParameterErrorChecks(pass *analysis.Pass) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	nodeFilter := []ast.Node{
@@ -884,7 +754,7 @@ func analyzeParameterErrorChecks(pass *analysis.Pass) {
 		sig := fn.Type().(*types.Signature)
 
 		// Find error-typed parameters
-		errorParams := findErrorParamVars(sig)
+		errorParams := internal.FindErrorParamVars(sig)
 		if len(errorParams) == 0 {
 			return
 		}
@@ -897,24 +767,10 @@ func analyzeParameterErrorChecks(pass *analysis.Pass) {
 	})
 }
 
-// findErrorParamVars returns a map from *types.Var (parameter) to its index
-// for all error-typed parameters in the signature.
-func findErrorParamVars(sig *types.Signature) map[*types.Var]int {
-	result := make(map[*types.Var]int)
-	params := sig.Params()
-	for i := 0; i < params.Len(); i++ {
-		param := params.At(i)
-		if isErrorType(param.Type()) {
-			result[param] = i
-		}
-	}
-	return result
-}
-
 // detectParameterErrorChecks walks a function body and detects errors.Is/As calls
 // on the given error parameters.
-func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorParams map[*types.Var]int) *ParameterCheckedErrorsFact {
-	fact := &ParameterCheckedErrorsFact{}
+func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorParams map[*types.Var]int) *facts.ParameterCheckedErrorsFact {
+	fact := &facts.ParameterCheckedErrorsFact{}
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -922,10 +778,10 @@ func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorP
 			return true
 		}
 
-		if isErrorsIsCall(pass, call) && len(call.Args) >= 2 {
+		if internal.IsErrorsIsCall(pass, call) && len(call.Args) >= 2 {
 			for paramVar, paramIdx := range errorParams {
-				if referencesVariable(pass, call.Args[0], paramVar) {
-					errInfo := extractErrorInfoFromExpr(pass, call.Args[1])
+				if internal.ReferencesVariable(pass, call.Args[0], paramVar) {
+					errInfo := internal.ExtractErrorInfoFromExpr(pass, call.Args[1])
 					if errInfo != nil {
 						fact.AddCheck(paramIdx, *errInfo)
 					}
@@ -933,10 +789,10 @@ func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorP
 			}
 		}
 
-		if isErrorsAsCall(pass, call) && len(call.Args) >= 2 {
+		if internal.IsErrorsAsCall(pass, call) && len(call.Args) >= 2 {
 			for paramVar, paramIdx := range errorParams {
-				if referencesVariable(pass, call.Args[0], paramVar) {
-					errInfo := extractErrorInfoFromAsTarget(pass, call.Args[1])
+				if internal.ReferencesVariable(pass, call.Args[0], paramVar) {
+					errInfo := internal.ExtractErrorInfoFromAsTarget(pass, call.Args[1])
 					if errInfo != nil {
 						fact.AddCheck(paramIdx, *errInfo)
 					}
@@ -951,39 +807,4 @@ func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorP
 		return nil
 	}
 	return fact
-}
-
-// extractErrorInfoFromExpr extracts ErrorInfo from an errors.Is target expression.
-func extractErrorInfoFromExpr(pass *analysis.Pass, expr ast.Expr) *ErrorInfo {
-	key := extractErrorKey(pass, expr)
-	if key == "" {
-		return nil
-	}
-	parts := splitErrorKey(key)
-	if parts == nil {
-		return nil
-	}
-	return &ErrorInfo{PkgPath: parts[0], Name: parts[1]}
-}
-
-// extractErrorInfoFromAsTarget extracts ErrorInfo from an errors.As target expression.
-func extractErrorInfoFromAsTarget(pass *analysis.Pass, expr ast.Expr) *ErrorInfo {
-	key := extractErrorKeyFromAsTarget(pass, expr)
-	if key == "" {
-		return nil
-	}
-	parts := splitErrorKey(key)
-	if parts == nil {
-		return nil
-	}
-	return &ErrorInfo{PkgPath: parts[0], Name: parts[1]}
-}
-
-// splitErrorKey splits "pkg.Name" into [pkg, Name].
-func splitErrorKey(key string) []string {
-	lastDot := strings.LastIndex(key, ".")
-	if lastDot < 0 {
-		return nil
-	}
-	return []string{key[:lastDot], key[lastDot+1:]}
 }

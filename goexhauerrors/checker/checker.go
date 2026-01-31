@@ -1,26 +1,28 @@
-package goexhauerrors
+package checker
 
 import (
 	"go/ast"
 	"go/token"
 	"go/types"
 
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/facts"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/internal"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 )
 
-// callSiteAnalyzer holds context for call site analysis to avoid recomputing expensive data.
-type callSiteAnalyzer struct {
-	pass           *analysis.Pass
-	interfaceImpls *interfaceImplementations
+// CallSiteAnalyzer holds context for call site analysis to avoid recomputing expensive data.
+type CallSiteAnalyzer struct {
+	Pass           *analysis.Pass
+	InterfaceImpls *internal.InterfaceImplementations
 }
 
-// checkCallSites checks all call sites to ensure errors are properly checked.
-func checkCallSites(pass *analysis.Pass, interfaceImpls *interfaceImplementations) {
-	csa := &callSiteAnalyzer{
-		pass:           pass,
-		interfaceImpls: interfaceImpls,
+// CheckCallSites checks all call sites to ensure errors are properly checked.
+func CheckCallSites(pass *analysis.Pass, interfaceImpls *internal.InterfaceImplementations) {
+	csa := &CallSiteAnalyzer{
+		Pass:           pass,
+		InterfaceImpls: interfaceImpls,
 	}
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -54,7 +56,7 @@ func checkCallSites(pass *analysis.Pass, interfaceImpls *interfaceImplementation
 			returnsError := false
 			results := sig.Results()
 			for i := 0; i < results.Len(); i++ {
-				if isErrorType(results.At(i).Type()) {
+				if internal.IsErrorType(results.At(i).Type()) {
 					returnsError = true
 					break
 				}
@@ -77,7 +79,7 @@ func funcReturnsError(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
 	sig := fn.Type().(*types.Signature)
 	results := sig.Results()
 	for i := 0; i < results.Len(); i++ {
-		if isErrorType(results.At(i).Type()) {
+		if internal.IsErrorType(results.At(i).Type()) {
 			return true
 		}
 	}
@@ -87,12 +89,12 @@ func funcReturnsError(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
 // errorVarState tracks the active errors for an error variable.
 type errorVarState struct {
 	callPos token.Pos
-	errors  []ErrorInfo
+	errors  []facts.ErrorInfo
 	checked map[string]bool
 }
 
 // checkFunctionBody checks all call sites within a function body using flow-sensitive analysis.
-func (csa *callSiteAnalyzer) checkFunctionBody(body *ast.BlockStmt, canPropagate bool) {
+func (csa *CallSiteAnalyzer) checkFunctionBody(body *ast.BlockStmt, canPropagate bool) {
 	// Track active error states for each variable
 	states := make(map[*types.Var]*errorVarState)
 
@@ -101,20 +103,20 @@ func (csa *callSiteAnalyzer) checkFunctionBody(body *ast.BlockStmt, canPropagate
 
 	// Report any remaining unchecked errors at end of function
 	for _, state := range states {
-		reportUncheckedErrors(csa.pass, state)
+		reportUncheckedErrors(csa.Pass, state)
 	}
 }
 
 // walkStatementsWithScope walks statements and tracks error variable states.
-func (csa *callSiteAnalyzer) walkStatementsWithScope(stmts []ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
+func (csa *CallSiteAnalyzer) walkStatementsWithScope(stmts []ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
 	for _, stmt := range stmts {
 		csa.walkStatementWithScope(stmt, states, canPropagate)
 	}
 }
 
 // walkStatementWithScope processes a single statement for error tracking.
-func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*types.Var]*errorVarState, canPropagate bool) {
+	pass := csa.Pass
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
 		// First, check for errors.Is in RHS expressions (before assignment)
@@ -149,9 +151,9 @@ func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 
 			// Set new state for this variable
 			states[errorVar] = &errorVarState{
-				callPos:   call.Pos(),
-				errors: fnFact.Errors,
-				checked:   make(map[string]bool),
+				callPos: call.Pos(),
+				errors:  fnFact.Errors,
+				checked: make(map[string]bool),
 			}
 		}
 
@@ -221,7 +223,7 @@ func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 					if switchTagVar != nil {
 						if state, ok := states[switchTagVar]; ok {
 							for _, expr := range cc.List {
-								errorKey := extractErrorKey(pass, expr)
+								errorKey := internal.ExtractErrorKey(pass, expr)
 								if errorKey != "" {
 									state.checked[errorKey] = true
 								}
@@ -284,7 +286,7 @@ func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 					if switchVar != nil {
 						if state, ok := states[switchVar]; ok {
 							for _, caseExpr := range cc.List {
-								typeName := extractTypeNameFromExpr(pass, caseExpr)
+								typeName := internal.ExtractTypeNameFromExpr(pass, caseExpr)
 								if typeName != "" {
 									state.checked[typeName] = true
 								}
@@ -386,11 +388,11 @@ func (csa *callSiteAnalyzer) walkStatementWithScope(stmt ast.Stmt, states map[*t
 						if i < len(valueSpec.Names) {
 							obj := pass.TypesInfo.Defs[valueSpec.Names[i]]
 							if varObj, ok := obj.(*types.Var); ok {
-								if isErrorType(varObj.Type()) {
+								if internal.IsErrorType(varObj.Type()) {
 									states[varObj] = &errorVarState{
-										callPos:   call.Pos(),
-										errors: fnFact.Errors,
-										checked:   make(map[string]bool),
+										callPos: call.Pos(),
+										errors:  fnFact.Errors,
+										checked: make(map[string]bool),
 									}
 								}
 							}
@@ -407,12 +409,12 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 	ast.Inspect(expr, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.CallExpr:
-			if isErrorsIsCall(pass, node) {
+			if internal.IsErrorsIsCall(pass, node) {
 				if len(node.Args) >= 2 {
 					// Find which error variable is being checked
 					for varObj, state := range states {
-						if referencesVariable(pass, node.Args[0], varObj) {
-							errorKey := extractErrorKey(pass, node.Args[1])
+						if internal.ReferencesVariable(pass, node.Args[0], varObj) {
+							errorKey := internal.ExtractErrorKey(pass, node.Args[1])
 							if errorKey != "" {
 								state.checked[errorKey] = true
 							}
@@ -421,11 +423,11 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 				}
 			}
 
-			if isErrorsAsCall(pass, node) {
+			if internal.IsErrorsAsCall(pass, node) {
 				if len(node.Args) >= 2 {
 					for varObj, state := range states {
-						if referencesVariable(pass, node.Args[0], varObj) {
-							errorKey := extractErrorKeyFromAsTarget(pass, node.Args[1])
+						if internal.ReferencesVariable(pass, node.Args[0], varObj) {
+							errorKey := internal.ExtractErrorKeyFromAsTarget(pass, node.Args[1])
 							if errorKey != "" {
 								state.checked[errorKey] = true
 							}
@@ -450,8 +452,8 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 // and marks the error as checked if so.
 func tryMarkDirectComparison(pass *analysis.Pass, lhs, rhs ast.Expr, states map[*types.Var]*errorVarState) {
 	for varObj, state := range states {
-		if referencesVariable(pass, lhs, varObj) {
-			errorKey := extractErrorKey(pass, rhs)
+		if internal.ReferencesVariable(pass, lhs, varObj) {
+			errorKey := internal.ExtractErrorKey(pass, rhs)
 			if errorKey != "" {
 				state.checked[errorKey] = true
 			}
@@ -461,12 +463,12 @@ func tryMarkDirectComparison(pass *analysis.Pass, lhs, rhs ast.Expr, states map[
 
 // isVariablePropagatedInReturn checks if a variable's errors are propagated
 // through a return expression. It distinguishes between:
-// - Direct return (return err) → propagation
-// - Function call with ParameterFlowFact (return WrapError(err)) → propagation
-// - fmt.Errorf with %w (return fmt.Errorf("...: %w", err)) → propagation
-// - Function call without ParameterFlowFact (return ConsumeError(err)) → NOT propagation
-func (csa *callSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targetVar *types.Var) bool {
-	pass := csa.pass
+// - Direct return (return err) -> propagation
+// - Function call with ParameterFlowFact (return WrapError(err)) -> propagation
+// - fmt.Errorf with %w (return fmt.Errorf("...: %w", err)) -> propagation
+// - Function call without ParameterFlowFact (return ConsumeError(err)) -> NOT propagation
+func (csa *CallSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targetVar *types.Var) bool {
+	pass := csa.Pass
 	switch expr := result.(type) {
 	case *ast.Ident:
 		// Direct return: return err
@@ -475,21 +477,21 @@ func (csa *callSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targe
 
 	case *ast.CallExpr:
 		// Check if the variable is used as an argument
-		argIndex := findArgIndexForVar(pass, expr, targetVar)
+		argIndex := internal.FindArgIndexForVar(pass, expr, targetVar)
 		if argIndex < 0 {
 			// Variable not found as a direct argument - fall back to referencesVariable
-			return referencesVariable(pass, result, targetVar)
+			return internal.ReferencesVariable(pass, result, targetVar)
 		}
 
 		// Special case: fmt.Errorf with %w
-		if isFmtErrorfCall(pass, expr) {
-			return isFmtErrorfWrappingVariable(pass, expr, targetVar)
+		if internal.IsFmtErrorfCall(pass, expr) {
+			return internal.IsFmtErrorfWrappingVariable(pass, expr, targetVar)
 		}
 
 		// Check if the called function has ParameterFlowFact for this argument
-		calledFn := getCalledFunction(pass, expr)
+		calledFn := internal.GetCalledFunction(pass, expr)
 		if calledFn != nil {
-			var flowFact ParameterFlowFact
+			var flowFact facts.ParameterFlowFact
 			if pass.ImportObjectFact(calledFn, &flowFact) {
 				return flowFact.HasFlowForParam(argIndex)
 			}
@@ -499,7 +501,7 @@ func (csa *callSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targe
 					return ifaceFlowFact.HasFlowForParam(argIndex)
 				}
 			}
-			// Function was analyzed but has no ParameterFlowFact → NOT propagation
+			// Function was analyzed but has no ParameterFlowFact -> NOT propagation
 			return false
 		}
 
@@ -508,65 +510,25 @@ func (csa *callSiteAnalyzer) isVariablePropagatedInReturn(result ast.Expr, targe
 
 	default:
 		// For other expressions, fall back to referencesVariable
-		return referencesVariable(pass, result, targetVar)
+		return internal.ReferencesVariable(pass, result, targetVar)
 	}
-}
-
-// findArgIndexForVar finds the index of a variable in a call's arguments.
-// Returns -1 if the variable is not found as a direct argument.
-func findArgIndexForVar(pass *analysis.Pass, call *ast.CallExpr, targetVar *types.Var) int {
-	for i, arg := range call.Args {
-		if ident, ok := arg.(*ast.Ident); ok {
-			obj := pass.TypesInfo.Uses[ident]
-			if obj == targetVar {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-// isFmtErrorfWrappingVariable checks if a fmt.Errorf call wraps the given variable with %w.
-func isFmtErrorfWrappingVariable(pass *analysis.Pass, call *ast.CallExpr, targetVar *types.Var) bool {
-	if len(call.Args) < 1 {
-		return false
-	}
-
-	formatStr := extractStringLiteral(call.Args[0])
-	if formatStr == "" {
-		return false
-	}
-
-	wrapIndices := findWrapVerbIndices(formatStr)
-	for _, wrapIdx := range wrapIndices {
-		argIdx := 1 + wrapIdx // args[0] is format string
-		if argIdx < len(call.Args) {
-			if ident, ok := call.Args[argIdx].(*ast.Ident); ok {
-				obj := pass.TypesInfo.Uses[ident]
-				if obj == targetVar {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // markTransferredErrorArgs marks tracked error variables as checked when they are
 // passed to a function that has ParameterFlowFact or ParameterCheckedErrorsFact.
 // - ParameterFlowFact: marks ALL errors as transferred (full propagation)
 // - ParameterCheckedErrorsFact: marks only the checked errors (partial check)
-func (csa *callSiteAnalyzer) markTransferredErrorArgs(call *ast.CallExpr, states map[*types.Var]*errorVarState) {
-	pass := csa.pass
-	calledFn := getCalledFunction(pass, call)
+func (csa *CallSiteAnalyzer) markTransferredErrorArgs(call *ast.CallExpr, states map[*types.Var]*errorVarState) {
+	pass := csa.Pass
+	calledFn := internal.GetCalledFunction(pass, call)
 	if calledFn == nil {
 		return
 	}
 
-	var flowFact ParameterFlowFact
+	var flowFact facts.ParameterFlowFact
 	hasFlowFact := pass.ImportObjectFact(calledFn, &flowFact)
 
-	var checkedFact ParameterCheckedErrorsFact
+	var checkedFact facts.ParameterCheckedErrorsFact
 	hasCheckedFact := pass.ImportObjectFact(calledFn, &checkedFact)
 
 	// Fallback for cross-package interface methods: dynamically compute from implementations
@@ -619,24 +581,24 @@ func (csa *callSiteAnalyzer) markTransferredErrorArgs(call *ast.CallExpr, states
 
 // markCheckedErrorsFromCall checks if a return expression is a function call
 // with ParameterCheckedErrorsFact and marks the checked errors on the variable's state.
-func (csa *callSiteAnalyzer) markCheckedErrorsFromCall(result ast.Expr, targetVar *types.Var, state *errorVarState) {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) markCheckedErrorsFromCall(result ast.Expr, targetVar *types.Var, state *errorVarState) {
+	pass := csa.Pass
 	call, ok := result.(*ast.CallExpr)
 	if !ok {
 		return
 	}
 
-	argIndex := findArgIndexForVar(pass, call, targetVar)
+	argIndex := internal.FindArgIndexForVar(pass, call, targetVar)
 	if argIndex < 0 {
 		return
 	}
 
-	calledFn := getCalledFunction(pass, call)
+	calledFn := internal.GetCalledFunction(pass, call)
 	if calledFn == nil {
 		return
 	}
 
-	var checkedFact ParameterCheckedErrorsFact
+	var checkedFact facts.ParameterCheckedErrorsFact
 	if pass.ImportObjectFact(calledFn, &checkedFact) {
 		markPartialCheckedErrors(state, &checkedFact, argIndex)
 	} else if sel, ok := result.(*ast.CallExpr).Fun.(*ast.SelectorExpr); ok {
@@ -648,7 +610,7 @@ func (csa *callSiteAnalyzer) markCheckedErrorsFromCall(result ast.Expr, targetVa
 }
 
 // markPartialCheckedErrors marks specific errors as checked based on ParameterCheckedErrorsFact.
-func markPartialCheckedErrors(state *errorVarState, checkedFact *ParameterCheckedErrorsFact, argIndex int) {
+func markPartialCheckedErrors(state *errorVarState, checkedFact *facts.ParameterCheckedErrorsFact, argIndex int) {
 	checkedErrors := checkedFact.GetCheckedErrors(argIndex)
 	for _, checkedErr := range checkedErrors {
 		checkedKey := checkedErr.Key()
@@ -664,7 +626,7 @@ func markPartialCheckedErrors(state *errorVarState, checkedFact *ParameterChecke
 func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
 	for _, errInfo := range state.errors {
 		// Skip ignored packages
-		if shouldIgnorePackage(errInfo.PkgPath) {
+		if internal.ShouldIgnorePackage(errInfo.PkgPath) {
 			continue
 		}
 		key := errInfo.Key()
@@ -715,22 +677,22 @@ func mergeStates(states map[*types.Var]*errorVarState, ifStates, elseStates map[
 // getCallErrors returns the FunctionErrorsFact and signature for a call expression.
 // It handles both regular function calls and closure variable calls.
 // It also resolves errors through ParameterFlowFact.
-func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsFact, *types.Signature) {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*facts.FunctionErrorsFact, *types.Signature) {
+	pass := csa.Pass
 	// First, try to get it as a regular function
-	calledFn := getCalledFunction(pass, call)
+	calledFn := internal.GetCalledFunction(pass, call)
 	if calledFn != nil {
 		sig := calledFn.Type().(*types.Signature)
 
 		// Start with FunctionErrorsFact
-		result := &FunctionErrorsFact{}
-		var fnFact FunctionErrorsFact
+		result := &facts.FunctionErrorsFact{}
+		var fnFact facts.FunctionErrorsFact
 		if pass.ImportObjectFact(calledFn, &fnFact) {
 			result.Merge(&fnFact)
 		}
 
 		// Also check for InterfaceMethodFact (for interface method calls)
-		var ifaceFact InterfaceMethodFact
+		var ifaceFact facts.InterfaceMethodFact
 		if pass.ImportObjectFact(calledFn, &ifaceFact) {
 			for _, err := range ifaceFact.Errors {
 				result.AddError(err)
@@ -738,7 +700,7 @@ func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsF
 		}
 
 		// Also resolve errors through ParameterFlowFact
-		var flowFact ParameterFlowFact
+		var flowFact facts.ParameterFlowFact
 		if pass.ImportObjectFact(calledFn, &flowFact) {
 			paramFlowErrors := resolveParameterFlowErrorsAST(pass, call, &flowFact)
 			for _, err := range paramFlowErrors {
@@ -756,7 +718,7 @@ func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsF
 		}
 
 		// Also resolve errors through FunctionParamCallFlowFact (for higher-order functions)
-		var callFlowFact FunctionParamCallFlowFact
+		var callFlowFact facts.FunctionParamCallFlowFact
 		if pass.ImportObjectFact(calledFn, &callFlowFact) {
 			callFlowErrors := resolveFunctionParamCallFlowErrors(pass, call, &callFlowFact)
 			for _, err := range callFlowErrors {
@@ -798,7 +760,7 @@ func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsF
 	}
 
 	// Check if the variable has a FunctionErrorsFact
-	var fnFact FunctionErrorsFact
+	var fnFact facts.FunctionErrorsFact
 	if pass.ImportObjectFact(varObj, &fnFact) {
 		// Get the signature from the variable's type
 		sig, ok := varObj.Type().Underlying().(*types.Signature)
@@ -813,8 +775,8 @@ func (csa *callSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*FunctionErrorsF
 
 // getInterfaceMethodErrors returns errors from an interface method call.
 // It checks if the receiver is an interface type and returns the InterfaceMethodFact.
-func (csa *callSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*FunctionErrorsFact, *types.Signature) {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*facts.FunctionErrorsFact, *types.Signature) {
+	pass := csa.Pass
 	// Check if the receiver is an interface type
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
@@ -840,23 +802,23 @@ func (csa *callSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*F
 	}
 
 	// Check for InterfaceMethodFact
-	var ifaceFact InterfaceMethodFact
+	var ifaceFact facts.InterfaceMethodFact
 	if pass.ImportObjectFact(method, &ifaceFact) {
-		return &FunctionErrorsFact{Errors: ifaceFact.Errors}, sig
+		return &facts.FunctionErrorsFact{Errors: ifaceFact.Errors}, sig
 	}
 
 	// If no fact found, try to find implementations in the current package
 	// This handles the case where the interface and implementations are in the same package
-	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.InterfaceImpls.GetImplementingTypes(ifaceType)
 
-	result := &FunctionErrorsFact{}
+	result := &facts.FunctionErrorsFact{}
 	for _, concreteType := range implementingTypes {
-		concreteMethod := findMethodImplementation(concreteType, method)
+		concreteMethod := internal.FindMethodImplementation(concreteType, method)
 		if concreteMethod == nil {
 			continue
 		}
 
-		var fnFact FunctionErrorsFact
+		var fnFact facts.FunctionErrorsFact
 		if pass.ImportObjectFact(concreteMethod, &fnFact) {
 			result.Merge(&fnFact)
 		}
@@ -872,8 +834,8 @@ func (csa *callSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*F
 // getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
 // from all implementations of an interface method.
 // Returns nil if the receiver is not an interface type or no implementations have flow facts.
-func (csa *callSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorExpr) *ParameterFlowFact {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorExpr) *facts.ParameterFlowFact {
+	pass := csa.Pass
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
 		return nil
@@ -891,24 +853,24 @@ func (csa *callSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorEx
 	}
 
 	// Check for ParameterFlowFact directly on the interface method
-	var flowFact ParameterFlowFact
+	var flowFact facts.ParameterFlowFact
 	if pass.ImportObjectFact(method, &flowFact) {
 		return &flowFact
 	}
 
 	// Dynamically compute intersection from implementations
-	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.InterfaceImpls.GetImplementingTypes(ifaceType)
 	if len(implementingTypes) == 0 {
 		return nil
 	}
 
-	var allFlowFacts []*ParameterFlowFact
+	var allFlowFacts []*facts.ParameterFlowFact
 	for _, concreteType := range implementingTypes {
-		concreteMethod := findMethodImplementation(concreteType, method)
+		concreteMethod := internal.FindMethodImplementation(concreteType, method)
 		if concreteMethod == nil {
 			continue
 		}
-		var pf ParameterFlowFact
+		var pf facts.ParameterFlowFact
 		if pass.ImportObjectFact(concreteMethod, &pf) {
 			allFlowFacts = append(allFlowFacts, &pf)
 		} else {
@@ -916,14 +878,14 @@ func (csa *callSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorEx
 		}
 	}
 
-	return intersectParameterFlowFacts(allFlowFacts)
+	return facts.IntersectParameterFlowFacts(allFlowFacts)
 }
 
 // getInterfaceMethodCheckedErrors returns the intersection of ParameterCheckedErrorsFact
 // from all implementations of an interface method.
 // Returns nil if the receiver is not an interface type or no implementations have checked facts.
-func (csa *callSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorExpr) *ParameterCheckedErrorsFact {
-	pass := csa.pass
+func (csa *CallSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorExpr) *facts.ParameterCheckedErrorsFact {
+	pass := csa.Pass
 	tv := pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
 		return nil
@@ -941,24 +903,24 @@ func (csa *callSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorEx
 	}
 
 	// Check for ParameterCheckedErrorsFact directly on the interface method
-	var checkedFact ParameterCheckedErrorsFact
+	var checkedFact facts.ParameterCheckedErrorsFact
 	if pass.ImportObjectFact(method, &checkedFact) {
 		return &checkedFact
 	}
 
 	// Dynamically compute intersection from implementations
-	implementingTypes := csa.interfaceImpls.getImplementingTypes(ifaceType)
+	implementingTypes := csa.InterfaceImpls.GetImplementingTypes(ifaceType)
 	if len(implementingTypes) == 0 {
 		return nil
 	}
 
-	var allCheckedFacts []*ParameterCheckedErrorsFact
+	var allCheckedFacts []*facts.ParameterCheckedErrorsFact
 	for _, concreteType := range implementingTypes {
-		concreteMethod := findMethodImplementation(concreteType, method)
+		concreteMethod := internal.FindMethodImplementation(concreteType, method)
 		if concreteMethod == nil {
 			continue
 		}
-		var cf ParameterCheckedErrorsFact
+		var cf facts.ParameterCheckedErrorsFact
 		if pass.ImportObjectFact(concreteMethod, &cf) {
 			allCheckedFacts = append(allCheckedFacts, &cf)
 		} else {
@@ -966,7 +928,7 @@ func (csa *callSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorEx
 		}
 	}
 
-	return intersectParameterCheckedErrorsFacts(allCheckedFacts)
+	return facts.IntersectParameterCheckedErrorsFacts(allCheckedFacts)
 }
 
 // flowInfo represents a parameter flow with index and wrapped flag.
@@ -976,21 +938,21 @@ type flowInfo interface {
 	IsWrapped() bool
 }
 
-// paramFlowAdapter adapts ParameterFlowInfo to flowInfo interface.
-type paramFlowAdapter struct{ f ParameterFlowInfo }
+// paramFlowAdapter adapts facts.ParameterFlowInfo to flowInfo interface.
+type paramFlowAdapter struct{ f facts.ParameterFlowInfo }
 
-func (a paramFlowAdapter) Index() int       { return a.f.ParamIndex }
-func (a paramFlowAdapter) IsWrapped() bool  { return a.f.Wrapped }
+func (a paramFlowAdapter) Index() int      { return a.f.ParamIndex }
+func (a paramFlowAdapter) IsWrapped() bool { return a.f.Wrapped }
 
-// funcParamCallFlowAdapter adapts FunctionParamCallFlowInfo to flowInfo interface.
-type funcParamCallFlowAdapter struct{ f FunctionParamCallFlowInfo }
+// funcParamCallFlowAdapter adapts facts.FunctionParamCallFlowInfo to flowInfo interface.
+type funcParamCallFlowAdapter struct{ f facts.FunctionParamCallFlowInfo }
 
-func (a funcParamCallFlowAdapter) Index() int       { return a.f.ParamIndex }
-func (a funcParamCallFlowAdapter) IsWrapped() bool  { return a.f.Wrapped }
+func (a funcParamCallFlowAdapter) Index() int      { return a.f.ParamIndex }
+func (a funcParamCallFlowAdapter) IsWrapped() bool { return a.f.Wrapped }
 
 // resolveFlowErrors resolves errors from call arguments based on flow information.
-func resolveFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flows []flowInfo) []ErrorInfo {
-	var errs []ErrorInfo
+func resolveFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flows []flowInfo) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	for _, flow := range flows {
 		if flow.Index() < 0 || flow.Index() >= len(call.Args) {
@@ -1012,7 +974,7 @@ func resolveFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flows []flowInfo
 }
 
 // resolveParameterFlowErrorsAST resolves errors from call arguments based on ParameterFlowFact.
-func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flowFact *ParameterFlowFact) []ErrorInfo {
+func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flowFact *facts.ParameterFlowFact) []facts.ErrorInfo {
 	flows := make([]flowInfo, len(flowFact.Flows))
 	for i, f := range flowFact.Flows {
 		flows[i] = paramFlowAdapter{f}
@@ -1021,30 +983,30 @@ func resolveParameterFlowErrorsAST(pass *analysis.Pass, call *ast.CallExpr, flow
 }
 
 // extractErrorsFromExpr extracts known errors from an expression.
-func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
-	var errs []ErrorInfo
+func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	switch e := expr.(type) {
 	case *ast.Ident:
 		obj := pass.TypesInfo.Uses[e]
 		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				errs = append(errs, ErrorInfo{
+				errs = append(errs, facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: false,
 				})
-			} else if varObj.Pkg() != nil && isErrorType(varObj.Type()) {
+			} else if varObj.Pkg() != nil && internal.IsErrorType(varObj.Type()) {
 				// Local error variable
-				errs = append(errs, ErrorInfo{
+				errs = append(errs, facts.ErrorInfo{
 					PkgPath: varObj.Pkg().Path(),
 					Name:    varObj.Name(),
 					Wrapped: false,
 				})
 			}
 			// Also check for FunctionErrorsFact (for closure variables)
-			var fnFact FunctionErrorsFact
+			var fnFact facts.FunctionErrorsFact
 			if pass.ImportObjectFact(varObj, &fnFact) {
 				errs = append(errs, fnFact.Errors...)
 			}
@@ -1053,9 +1015,9 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
 	case *ast.SelectorExpr:
 		obj := pass.TypesInfo.Uses[e.Sel]
 		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
+			var errorFact facts.ErrorFact
 			if pass.ImportObjectFact(varObj, &errorFact) {
-				errs = append(errs, ErrorInfo{
+				errs = append(errs, facts.ErrorInfo{
 					PkgPath: errorFact.PkgPath,
 					Name:    errorFact.Name,
 					Wrapped: false,
@@ -1065,14 +1027,14 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
 
 	case *ast.CallExpr:
 		// If the argument is a function call, recursively get its errors
-		calledFn := getCalledFunction(pass, e)
+		calledFn := internal.GetCalledFunction(pass, e)
 		if calledFn != nil {
-			var fnFact FunctionErrorsFact
+			var fnFact facts.FunctionErrorsFact
 			if pass.ImportObjectFact(calledFn, &fnFact) {
 				errs = append(errs, fnFact.Errors...)
 			}
 			// Also check ParameterFlowFact for chained wrappers
-			var flowFact ParameterFlowFact
+			var flowFact facts.ParameterFlowFact
 			if pass.ImportObjectFact(calledFn, &flowFact) {
 				paramErrs := resolveParameterFlowErrorsAST(pass, e, &flowFact)
 				errs = append(errs, paramErrs...)
@@ -1098,15 +1060,15 @@ func extractErrorsFromExpr(pass *analysis.Pass, expr ast.Expr) []ErrorInfo {
 }
 
 // extractErrorsFromCompositeLit extracts error type information from a composite literal.
-func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit) []ErrorInfo {
-	var errs []ErrorInfo
+func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLit) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
 
 	tv := pass.TypesInfo.Types[compLit]
 	if !tv.IsValue() {
 		return nil
 	}
 
-	namedType := extractNamedType(tv.Type)
+	namedType := internal.ExtractNamedType(tv.Type)
 	if namedType == nil {
 		return nil
 	}
@@ -1116,16 +1078,16 @@ func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLi
 		return nil
 	}
 
-	var errorFact ErrorFact
+	var errorFact facts.ErrorFact
 	if pass.ImportObjectFact(typeName, &errorFact) {
-		errs = append(errs, ErrorInfo{
+		errs = append(errs, facts.ErrorInfo{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
 			Wrapped: false,
 		})
 	} else if typeName.Pkg() != nil {
 		// Local custom error type
-		errs = append(errs, ErrorInfo{
+		errs = append(errs, facts.ErrorInfo{
 			PkgPath: typeName.Pkg().Path(),
 			Name:    typeName.Name(),
 			Wrapped: false,
@@ -1136,7 +1098,7 @@ func extractErrorsFromCompositeLit(pass *analysis.Pass, compLit *ast.CompositeLi
 }
 
 // analyzeFuncLitErrors analyzes a function literal (lambda) body to extract errors.
-func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []ErrorInfo {
+func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []facts.ErrorInfo {
 	tv := pass.TypesInfo.Types[funcLit]
 	if !tv.IsValue() {
 		return nil
@@ -1147,12 +1109,12 @@ func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []ErrorInfo
 		return nil
 	}
 
-	errorPositions := findErrorReturnPositions(sig)
+	errorPositions := internal.FindErrorReturnPositions(sig)
 	if len(errorPositions) == 0 {
 		return nil
 	}
 
-	var errs []ErrorInfo
+	var errs []facts.ErrorInfo
 	ast.Inspect(funcLit.Body, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok {
@@ -1172,7 +1134,7 @@ func analyzeFuncLitErrors(pass *analysis.Pass, funcLit *ast.FuncLit) []ErrorInfo
 
 // resolveFunctionParamCallFlowErrors resolves errors from function parameters that are called.
 // This handles higher-order functions like RunInTx(fn func() error) error { return fn() }
-func resolveFunctionParamCallFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flowFact *FunctionParamCallFlowFact) []ErrorInfo {
+func resolveFunctionParamCallFlowErrors(pass *analysis.Pass, call *ast.CallExpr, flowFact *facts.FunctionParamCallFlowFact) []facts.ErrorInfo {
 	flows := make([]flowInfo, len(flowFact.CallFlows))
 	for i, f := range flowFact.CallFlows {
 		flows[i] = funcParamCallFlowAdapter{f}
@@ -1188,7 +1150,7 @@ func findErrorVarInAssignmentWithSig(pass *analysis.Pass, stmt *ast.AssignStmt, 
 	if len(stmt.Rhs) == 1 && results.Len() > 1 {
 		// Single call with multiple returns: x, err := someFunc()
 		for i := 0; i < results.Len(); i++ {
-			if isErrorType(results.At(i).Type()) {
+			if internal.IsErrorType(results.At(i).Type()) {
 				if i < len(stmt.Lhs) {
 					ident, ok := stmt.Lhs[i].(*ast.Ident)
 					if !ok || ident.Name == "_" {
@@ -1216,7 +1178,7 @@ func findErrorVarInAssignmentWithSig(pass *analysis.Pass, stmt *ast.AssignStmt, 
 				obj = pass.TypesInfo.Uses[ident]
 			}
 			if varObj, ok := obj.(*types.Var); ok {
-				if isErrorType(varObj.Type()) {
+				if internal.IsErrorType(varObj.Type()) {
 					return varObj
 				}
 			}
@@ -1225,168 +1187,3 @@ func findErrorVarInAssignmentWithSig(pass *analysis.Pass, stmt *ast.AssignStmt, 
 
 	return nil
 }
-
-// isErrorsIsCall checks if the call is errors.Is().
-func isErrorsIsCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	return isErrorsPkgCall(pass, call, "Is")
-}
-
-// isErrorsAsCall checks if the call is errors.As().
-func isErrorsAsCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	return isErrorsPkgCall(pass, call, "As")
-}
-
-// isErrorsPkgCall checks if the call is errors.<funcName>().
-func isErrorsPkgCall(pass *analysis.Pass, call *ast.CallExpr, funcName string) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-
-	if sel.Sel.Name != funcName {
-		return false
-	}
-
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-
-	obj := pass.TypesInfo.Uses[ident]
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return false
-	}
-
-	return pkgName.Imported().Path() == "errors"
-}
-
-// extractErrorKeyFromAsTarget extracts the error key from errors.As target.
-// errors.As(err, &target) where target is *SomeErrorType
-func extractErrorKeyFromAsTarget(pass *analysis.Pass, expr ast.Expr) string {
-	// errors.As takes a pointer to the target, so we need to get the underlying type
-	tv := pass.TypesInfo.Types[expr]
-	if !tv.IsValue() {
-		return ""
-	}
-
-	// The second argument should be **SomeErrorType or *interface type
-	ptrType, ok := tv.Type.(*types.Pointer)
-	if !ok {
-		return ""
-	}
-
-	// Get the element type (should be *SomeErrorType or interface)
-	elemType := ptrType.Elem()
-
-	// If it's a pointer to a named type
-	if innerPtr, ok := elemType.(*types.Pointer); ok {
-		if named, ok := innerPtr.Elem().(*types.Named); ok {
-			typeName := named.Obj()
-			var errorFact ErrorFact
-			if pass.ImportObjectFact(typeName, &errorFact) {
-				return errorFact.PkgPath + "." + errorFact.Name
-			}
-			if typeName.Pkg() != nil {
-				return typeName.Pkg().Path() + "." + typeName.Name()
-			}
-		}
-	}
-
-	// If it's a named type directly (non-pointer error type)
-	if named, ok := elemType.(*types.Named); ok {
-		typeName := named.Obj()
-		var errorFact ErrorFact
-		if pass.ImportObjectFact(typeName, &errorFact) {
-			return errorFact.PkgPath + "." + errorFact.Name
-		}
-		if typeName.Pkg() != nil {
-			return typeName.Pkg().Path() + "." + typeName.Name()
-		}
-	}
-
-	return ""
-}
-
-// referencesVariable checks if an expression references the given variable.
-func referencesVariable(pass *analysis.Pass, expr ast.Expr, targetVar *types.Var) bool {
-	var found bool
-	ast.Inspect(expr, func(n ast.Node) bool {
-		ident, ok := n.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		obj := pass.TypesInfo.Uses[ident]
-		if obj == targetVar {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
-}
-
-// extractTypeNameFromExpr extracts the error key from a type expression in a type switch case.
-// Handles: *SomeError, SomeError, *pkg.SomeError, pkg.SomeError
-func extractTypeNameFromExpr(pass *analysis.Pass, expr ast.Expr) string {
-	// Handle pointer types: *SomeError
-	if star, ok := expr.(*ast.StarExpr); ok {
-		expr = star.X
-	}
-
-	tv := pass.TypesInfo.Types[expr]
-	if !tv.IsType() {
-		return ""
-	}
-
-	t := tv.Type
-	// Unwrap pointer if still present
-	if ptr, ok := t.(*types.Pointer); ok {
-		t = ptr.Elem()
-	}
-
-	if named, ok := t.(*types.Named); ok {
-		typeName := named.Obj()
-		var errorFact ErrorFact
-		if pass.ImportObjectFact(typeName, &errorFact) {
-			return errorFact.PkgPath + "." + errorFact.Name
-		}
-		if typeName.Pkg() != nil {
-			return typeName.Pkg().Path() + "." + typeName.Name()
-		}
-	}
-	return ""
-}
-
-// extractErrorKey extracts the error key from an errors.Is second argument.
-func extractErrorKey(pass *analysis.Pass, expr ast.Expr) string {
-	switch e := expr.(type) {
-	case *ast.Ident:
-		obj := pass.TypesInfo.Uses[e]
-		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
-			if pass.ImportObjectFact(varObj, &errorFact) {
-				return errorFact.PkgPath + "." + errorFact.Name
-			}
-			// For local errors in same package
-			if varObj.Pkg() != nil {
-				return varObj.Pkg().Path() + "." + varObj.Name()
-			}
-		}
-
-	case *ast.SelectorExpr:
-		obj := pass.TypesInfo.Uses[e.Sel]
-		if varObj, ok := obj.(*types.Var); ok {
-			var errorFact ErrorFact
-			if pass.ImportObjectFact(varObj, &errorFact) {
-				return errorFact.PkgPath + "." + errorFact.Name
-			}
-			if varObj.Pkg() != nil {
-				return varObj.Pkg().Path() + "." + varObj.Name()
-			}
-		}
-	}
-
-	return ""
-}
-

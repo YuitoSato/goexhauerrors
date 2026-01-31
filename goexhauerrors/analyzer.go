@@ -1,8 +1,11 @@
 package goexhauerrors
 
 import (
-	"go/types"
-
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/analyzer"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/checker"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/detector"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/facts"
+	"github.com/YuitoSato/goexhauerrors/goexhauerrors/internal"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -25,48 +28,36 @@ var Analyzer = &analysis.Analyzer{
 		buildssa.Analyzer,
 	},
 	FactTypes: []analysis.Fact{
-		(*ErrorFact)(nil),
-		(*FunctionErrorsFact)(nil),
-		(*ParameterFlowFact)(nil),
-		(*InterfaceMethodFact)(nil),
-		(*FunctionParamCallFlowFact)(nil),
-		(*ParameterCheckedErrorsFact)(nil),
+		(*facts.ErrorFact)(nil),
+		(*facts.FunctionErrorsFact)(nil),
+		(*facts.ParameterFlowFact)(nil),
+		(*facts.InterfaceMethodFact)(nil),
+		(*facts.FunctionParamCallFlowFact)(nil),
+		(*facts.ParameterCheckedErrorsFact)(nil),
 	},
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	// Set ignore packages for the internal package
+	internal.SetIgnorePackages(ignorePackages)
+
 	// Phase 1: Detect local errors (sentinels and custom types) in this package and export facts
-	localErrors := detectLocalErrors(pass)
+	localErrors := detector.DetectLocalErrors(pass)
 
 	// Phase 2: Analyze function bodies for returns
-	localFacts, localParamFlowFacts, interfaceImpls := analyzeFunctionReturns(pass, localErrors)
+	localFacts, localParamFlowFacts, interfaceImpls := analyzer.AnalyzeFunctionReturns(pass, localErrors)
 
 	// Phase 2b: Analyze closures assigned to variables
-	analyzeClosures(pass, localErrors)
+	analyzer.AnalyzeClosures(pass, localErrors)
 
 	// Phase 2c: Analyze errors.Is/As checks on function parameters
-	analyzeParameterErrorChecks(pass)
+	analyzer.AnalyzeParameterErrorChecks(pass)
 
 	// Phase 2d: Compute interface method facts (after ParameterCheckedErrorsFact is available)
-	computeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
+	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
 
 	// Phase 3: Check call sites for exhaustive errors.Is checks
-	checkCallSites(pass, interfaceImpls)
+	checker.CheckCallSites(pass, interfaceImpls)
 
 	return nil, nil
-}
-
-// localErrors holds local error information for the current package.
-type localErrors struct {
-	// vars maps *types.Var to true for error variables defined with errors.New() or fmt.Errorf()
-	vars map[*types.Var]bool
-	// types maps *types.TypeName to true for custom error types
-	types map[*types.TypeName]bool
-}
-
-func newLocalErrors() *localErrors {
-	return &localErrors{
-		vars:  make(map[*types.Var]bool),
-		types: make(map[*types.TypeName]bool),
-	}
 }
