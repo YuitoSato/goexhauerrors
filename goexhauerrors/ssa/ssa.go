@@ -859,11 +859,17 @@ func (a *Analyzer) traceValueToFunctionParamCalls(val ssa.Value, params []*ssa.P
 			}
 		}
 
-		// Also check for fmt.Errorf wrapping the result of a function parameter call
+		// Also check for fmt.Errorf wrapping the result of a function parameter call,
+		// or transitive call flow through another higher-order function
 		callee := v.Call.StaticCallee()
-		if callee != nil && isFmtErrorfSSA(callee) {
-			wrappedFlows := a.analyzeErrorfWrappingForFunctionParamCalls(v, params, visited, depth)
-			flows = append(flows, wrappedFlows...)
+		if callee != nil {
+			if isFmtErrorfSSA(callee) {
+				wrappedFlows := a.analyzeErrorfWrappingForFunctionParamCalls(v, params, visited, depth)
+				flows = append(flows, wrappedFlows...)
+			} else {
+				transitiveFlows := a.traceTransitiveFunctionParamCallFlow(v, params, visited, depth)
+				flows = append(flows, transitiveFlows...)
+			}
 		}
 
 	case *ssa.Phi:
@@ -919,6 +925,83 @@ func deduplicateFunctionParamCallFlows(flows []facts.FunctionParamCallFlowInfo) 
 		}
 	}
 	return result
+}
+
+// traceTransitiveFunctionParamCallFlow handles the case where a function passes its
+// function-typed parameter to another higher-order function (transitive call flow).
+// Example: func Wrapper(fn func() error) error { return RunWithCallback(fn) }
+func (a *Analyzer) traceTransitiveFunctionParamCallFlow(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.FunctionParamCallFlowInfo {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return nil
+	}
+
+	fn := callee.Object()
+	if fn == nil {
+		return nil
+	}
+
+	typesFunc, ok := fn.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Get FunctionParamCallFlowFact for the called function
+	var callFlowFact *facts.FunctionParamCallFlowFact
+	if localFact, ok := a.LocalCallFlowFacts[typesFunc]; ok {
+		callFlowFact = localFact
+	}
+	var importedFact facts.FunctionParamCallFlowFact
+	if a.pass.ImportObjectFact(typesFunc, &importedFact) {
+		if callFlowFact == nil {
+			callFlowFact = &importedFact
+		}
+	}
+
+	if callFlowFact == nil || len(callFlowFact.CallFlows) == 0 {
+		return nil
+	}
+
+	var flows []facts.FunctionParamCallFlowInfo
+	args := call.Call.Args
+
+	for _, callFlow := range callFlowFact.CallFlows {
+		argIdx := callFlow.ParamIndex
+		// For static method calls, SSA args include the receiver at index 0,
+		// but the fact stores indices with receiver already subtracted.
+		// Re-add the offset to index into call.Call.Args correctly.
+		if callee.Signature.Recv() != nil {
+			argIdx++
+		}
+		if argIdx >= len(args) {
+			continue
+		}
+
+		// Trace the argument back to see if it's a parameter of the outer function
+		arg := args[argIdx]
+		if param, ok := arg.(*ssa.Parameter); ok {
+			for i, p := range params {
+				if p == param {
+					flows = append(flows, facts.FunctionParamCallFlowInfo{
+						ParamIndex: i,
+						Wrapped:    callFlow.Wrapped,
+					})
+				}
+			}
+		} else {
+			// Handle cases where the argument is derived from a parameter
+			// through phi nodes, etc. by recursively tracing
+			paramFlows := a.traceValueToFunctionParamCalls(arg, params, visited, depth+1)
+			for i := range paramFlows {
+				if callFlow.Wrapped {
+					paramFlows[i].Wrapped = true
+				}
+			}
+			flows = append(flows, paramFlows...)
+		}
+	}
+
+	return flows
 }
 
 // traceValueToParameters traces an SSA value back to see if it originates from parameters.
