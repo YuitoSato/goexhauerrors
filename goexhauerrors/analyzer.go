@@ -30,6 +30,7 @@ var Analyzer = &analysis.Analyzer{
 		(*ParameterFlowFact)(nil),
 		(*InterfaceMethodFact)(nil),
 		(*FunctionParamCallFlowFact)(nil),
+		(*ParameterCheckedErrorsFact)(nil),
 	},
 }
 
@@ -42,6 +43,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	// Phase 2b: Analyze closures assigned to variables
 	analyzeClosures(pass, localErrors)
+
+	// Phase 2c: Analyze errors.Is/As checks on function parameters
+	analyzeParameterErrorChecks(pass)
 
 	// Phase 3: Check call sites for exhaustive errors.Is checks
 	checkCallSites(pass)

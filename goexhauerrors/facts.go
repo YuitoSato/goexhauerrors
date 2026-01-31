@@ -8,6 +8,7 @@ func init() {
 	gob.Register(&ParameterFlowFact{})
 	gob.Register(&InterfaceMethodFact{})
 	gob.Register(&FunctionParamCallFlowFact{})
+	gob.Register(&ParameterCheckedErrorsFact{})
 }
 
 // ErrorFact marks a variable or type as an error.
@@ -139,6 +140,16 @@ func (f *ParameterFlowFact) AddFlow(flow ParameterFlowInfo) {
 	f.Flows = append(f.Flows, flow)
 }
 
+// HasFlowForParam checks if any parameter flow exists for the given parameter index.
+func (f *ParameterFlowFact) HasFlowForParam(paramIndex int) bool {
+	for _, flow := range f.Flows {
+		if flow.ParamIndex == paramIndex {
+			return true
+		}
+	}
+	return false
+}
+
 // Merge merges another fact's flows into this one.
 func (f *ParameterFlowFact) Merge(other *ParameterFlowFact) {
 	for _, flow := range other.Flows {
@@ -243,4 +254,73 @@ func (f *FunctionParamCallFlowFact) Merge(other *FunctionParamCallFlowFact) {
 	for _, flow := range other.CallFlows {
 		f.AddCallFlow(flow)
 	}
+}
+
+// ParameterCheckedErrorInfo describes which errors are checked with errors.Is/As
+// on a specific error parameter inside a function body.
+type ParameterCheckedErrorInfo struct {
+	ParamIndex    int         // Index of the error parameter (0-based, excluding receiver)
+	CheckedErrors []ErrorInfo // Errors checked with errors.Is/As on this parameter
+}
+
+// ParameterCheckedErrorsFact stores which errors are checked with errors.Is/As
+// on each error parameter inside a function body.
+// Attached to *types.Func objects.
+type ParameterCheckedErrorsFact struct {
+	Checks []ParameterCheckedErrorInfo
+}
+
+func (*ParameterCheckedErrorsFact) AFact() {}
+
+func (f *ParameterCheckedErrorsFact) String() string {
+	if len(f.Checks) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, check := range f.Checks {
+		if i > 0 {
+			result += ", "
+		}
+		result += "param" + string(rune('0'+check.ParamIndex)) + ":["
+		for j, err := range check.CheckedErrors {
+			if j > 0 {
+				result += ","
+			}
+			result += err.Key()
+		}
+		result += "]"
+	}
+	result += "]"
+	return result
+}
+
+// AddCheck adds a checked error for a parameter.
+func (f *ParameterCheckedErrorsFact) AddCheck(paramIndex int, errInfo ErrorInfo) {
+	key := errInfo.Key()
+	for i, check := range f.Checks {
+		if check.ParamIndex == paramIndex {
+			// Check if already present
+			for _, existing := range check.CheckedErrors {
+				if existing.Key() == key {
+					return
+				}
+			}
+			f.Checks[i].CheckedErrors = append(f.Checks[i].CheckedErrors, errInfo)
+			return
+		}
+	}
+	f.Checks = append(f.Checks, ParameterCheckedErrorInfo{
+		ParamIndex:    paramIndex,
+		CheckedErrors: []ErrorInfo{errInfo},
+	})
+}
+
+// GetCheckedErrors returns the checked errors for a given parameter index.
+func (f *ParameterCheckedErrorsFact) GetCheckedErrors(paramIndex int) []ErrorInfo {
+	for _, check := range f.Checks {
+		if check.ParamIndex == paramIndex {
+			return check.CheckedErrors
+		}
+	}
+	return nil
 }

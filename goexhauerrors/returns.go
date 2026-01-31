@@ -813,3 +813,135 @@ func computeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 		}
 	}
 }
+
+// analyzeParameterErrorChecks analyzes all functions to detect errors.Is/As checks
+// performed on error-typed parameters inside the function body.
+// This allows callers to know which errors are already checked inside the function.
+func analyzeParameterErrorChecks(pass *analysis.Pass) {
+	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
+	nodeFilter := []ast.Node{
+		(*ast.FuncDecl)(nil),
+	}
+
+	insp.Preorder(nodeFilter, func(n ast.Node) {
+		funcDecl := n.(*ast.FuncDecl)
+		if funcDecl.Body == nil {
+			return
+		}
+
+		funcObj := pass.TypesInfo.Defs[funcDecl.Name]
+		if funcObj == nil {
+			return
+		}
+		fn, ok := funcObj.(*types.Func)
+		if !ok {
+			return
+		}
+
+		sig := fn.Type().(*types.Signature)
+
+		// Find error-typed parameters
+		errorParams := findErrorParamVars(sig)
+		if len(errorParams) == 0 {
+			return
+		}
+
+		// Analyze the body for errors.Is/As calls on those parameters
+		fact := detectParameterErrorChecks(pass, funcDecl.Body, errorParams)
+		if fact != nil && len(fact.Checks) > 0 {
+			pass.ExportObjectFact(fn, fact)
+		}
+	})
+}
+
+// findErrorParamVars returns a map from *types.Var (parameter) to its index
+// for all error-typed parameters in the signature.
+func findErrorParamVars(sig *types.Signature) map[*types.Var]int {
+	result := make(map[*types.Var]int)
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		param := params.At(i)
+		if isErrorType(param.Type()) {
+			result[param] = i
+		}
+	}
+	return result
+}
+
+// detectParameterErrorChecks walks a function body and detects errors.Is/As calls
+// on the given error parameters.
+func detectParameterErrorChecks(pass *analysis.Pass, body *ast.BlockStmt, errorParams map[*types.Var]int) *ParameterCheckedErrorsFact {
+	fact := &ParameterCheckedErrorsFact{}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		if isErrorsIsCall(pass, call) && len(call.Args) >= 2 {
+			for paramVar, paramIdx := range errorParams {
+				if referencesVariable(pass, call.Args[0], paramVar) {
+					errInfo := extractErrorInfoFromExpr(pass, call.Args[1])
+					if errInfo != nil {
+						fact.AddCheck(paramIdx, *errInfo)
+					}
+				}
+			}
+		}
+
+		if isErrorsAsCall(pass, call) && len(call.Args) >= 2 {
+			for paramVar, paramIdx := range errorParams {
+				if referencesVariable(pass, call.Args[0], paramVar) {
+					errInfo := extractErrorInfoFromAsTarget(pass, call.Args[1])
+					if errInfo != nil {
+						fact.AddCheck(paramIdx, *errInfo)
+					}
+				}
+			}
+		}
+
+		return true
+	})
+
+	if len(fact.Checks) == 0 {
+		return nil
+	}
+	return fact
+}
+
+// extractErrorInfoFromExpr extracts ErrorInfo from an errors.Is target expression.
+func extractErrorInfoFromExpr(pass *analysis.Pass, expr ast.Expr) *ErrorInfo {
+	key := extractErrorKey(pass, expr)
+	if key == "" {
+		return nil
+	}
+	parts := splitErrorKey(key)
+	if parts == nil {
+		return nil
+	}
+	return &ErrorInfo{PkgPath: parts[0], Name: parts[1]}
+}
+
+// extractErrorInfoFromAsTarget extracts ErrorInfo from an errors.As target expression.
+func extractErrorInfoFromAsTarget(pass *analysis.Pass, expr ast.Expr) *ErrorInfo {
+	key := extractErrorKeyFromAsTarget(pass, expr)
+	if key == "" {
+		return nil
+	}
+	parts := splitErrorKey(key)
+	if parts == nil {
+		return nil
+	}
+	return &ErrorInfo{PkgPath: parts[0], Name: parts[1]}
+}
+
+// splitErrorKey splits "pkg.Name" into [pkg, Name].
+func splitErrorKey(key string) []string {
+	lastDot := strings.LastIndex(key, ".")
+	if lastDot < 0 {
+		return nil
+	}
+	return []string{key[:lastDot], key[lastDot+1:]}
+}

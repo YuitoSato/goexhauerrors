@@ -96,6 +96,9 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 				continue
 			}
 
+			// Mark tracked error variables as transferred when passed to functions with ParameterFlowFact
+			markTransferredErrorArgs(pass, call, states)
+
 			fnFact, sig := getCallErrors(pass, call)
 			if fnFact == nil || len(fnFact.Errors) == 0 {
 				continue
@@ -186,13 +189,16 @@ func walkStatementWithScope(pass *analysis.Pass, stmt ast.Stmt, states map[*type
 		// Check if error variables are propagated
 		for varObj, state := range states {
 			for _, result := range s.Results {
-				if referencesVariable(pass, result, varObj) {
+				if isVariablePropagatedInReturn(pass, result, varObj) {
 					if canPropagate {
 						// Mark all errors as "checked" since we're propagating
 						for _, errInfo := range state.errors {
 							state.checked[errInfo.Key()] = true
 						}
 					}
+				} else {
+					// Not fully propagated - check for partial checks via ParameterCheckedErrorsFact
+					markCheckedErrorsFromCall(pass, result, varObj, state)
 				}
 			}
 		}
@@ -290,6 +296,175 @@ func collectErrorsIsInExpr(pass *analysis.Pass, expr ast.Expr, states map[*types
 
 		return true
 	})
+}
+
+// isVariablePropagatedInReturn checks if a variable's errors are propagated
+// through a return expression. It distinguishes between:
+// - Direct return (return err) → propagation
+// - Function call with ParameterFlowFact (return WrapError(err)) → propagation
+// - fmt.Errorf with %w (return fmt.Errorf("...: %w", err)) → propagation
+// - Function call without ParameterFlowFact (return ConsumeError(err)) → NOT propagation
+func isVariablePropagatedInReturn(pass *analysis.Pass, result ast.Expr, targetVar *types.Var) bool {
+	switch expr := result.(type) {
+	case *ast.Ident:
+		// Direct return: return err
+		obj := pass.TypesInfo.Uses[expr]
+		return obj == targetVar
+
+	case *ast.CallExpr:
+		// Check if the variable is used as an argument
+		argIndex := findArgIndexForVar(pass, expr, targetVar)
+		if argIndex < 0 {
+			// Variable not found as a direct argument - fall back to referencesVariable
+			return referencesVariable(pass, result, targetVar)
+		}
+
+		// Special case: fmt.Errorf with %w
+		if isFmtErrorfCall(pass, expr) {
+			return isFmtErrorfWrappingVariable(pass, expr, targetVar)
+		}
+
+		// Check if the called function has ParameterFlowFact for this argument
+		calledFn := getCalledFunction(pass, expr)
+		if calledFn != nil {
+			var flowFact ParameterFlowFact
+			if pass.ImportObjectFact(calledFn, &flowFact) {
+				return flowFact.HasFlowForParam(argIndex)
+			}
+			// Function was analyzed but has no ParameterFlowFact → NOT propagation
+			return false
+		}
+
+		// Unknown function (e.g., closure variable) - conservative: treat as propagation
+		return true
+
+	default:
+		// For other expressions, fall back to referencesVariable
+		return referencesVariable(pass, result, targetVar)
+	}
+}
+
+// findArgIndexForVar finds the index of a variable in a call's arguments.
+// Returns -1 if the variable is not found as a direct argument.
+func findArgIndexForVar(pass *analysis.Pass, call *ast.CallExpr, targetVar *types.Var) int {
+	for i, arg := range call.Args {
+		if ident, ok := arg.(*ast.Ident); ok {
+			obj := pass.TypesInfo.Uses[ident]
+			if obj == targetVar {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// isFmtErrorfWrappingVariable checks if a fmt.Errorf call wraps the given variable with %w.
+func isFmtErrorfWrappingVariable(pass *analysis.Pass, call *ast.CallExpr, targetVar *types.Var) bool {
+	if len(call.Args) < 1 {
+		return false
+	}
+
+	formatStr := extractStringLiteral(call.Args[0])
+	if formatStr == "" {
+		return false
+	}
+
+	wrapIndices := findWrapVerbIndices(formatStr)
+	for _, wrapIdx := range wrapIndices {
+		argIdx := 1 + wrapIdx // args[0] is format string
+		if argIdx < len(call.Args) {
+			if ident, ok := call.Args[argIdx].(*ast.Ident); ok {
+				obj := pass.TypesInfo.Uses[ident]
+				if obj == targetVar {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// markTransferredErrorArgs marks tracked error variables as checked when they are
+// passed to a function that has ParameterFlowFact or ParameterCheckedErrorsFact.
+// - ParameterFlowFact: marks ALL errors as transferred (full propagation)
+// - ParameterCheckedErrorsFact: marks only the checked errors (partial check)
+func markTransferredErrorArgs(pass *analysis.Pass, call *ast.CallExpr, states map[*types.Var]*errorVarState) {
+	calledFn := getCalledFunction(pass, call)
+	if calledFn == nil {
+		return
+	}
+
+	var flowFact ParameterFlowFact
+	hasFlowFact := pass.ImportObjectFact(calledFn, &flowFact)
+
+	var checkedFact ParameterCheckedErrorsFact
+	hasCheckedFact := pass.ImportObjectFact(calledFn, &checkedFact)
+
+	if !hasFlowFact && !hasCheckedFact {
+		return
+	}
+
+	for i, arg := range call.Args {
+		ident, ok := arg.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		obj := pass.TypesInfo.Uses[ident]
+		varObj, ok := obj.(*types.Var)
+		if !ok {
+			continue
+		}
+		state, ok := states[varObj]
+		if !ok {
+			continue
+		}
+		// If this argument position has a parameter flow, mark ALL errors as transferred
+		if hasFlowFact && flowFact.HasFlowForParam(i) {
+			for _, errInfo := range state.errors {
+				state.checked[errInfo.Key()] = true
+			}
+		} else if hasCheckedFact {
+			// Mark only the specific errors that are checked inside the function
+			markPartialCheckedErrors(state, &checkedFact, i)
+		}
+	}
+}
+
+// markCheckedErrorsFromCall checks if a return expression is a function call
+// with ParameterCheckedErrorsFact and marks the checked errors on the variable's state.
+func markCheckedErrorsFromCall(pass *analysis.Pass, result ast.Expr, targetVar *types.Var, state *errorVarState) {
+	call, ok := result.(*ast.CallExpr)
+	if !ok {
+		return
+	}
+
+	argIndex := findArgIndexForVar(pass, call, targetVar)
+	if argIndex < 0 {
+		return
+	}
+
+	calledFn := getCalledFunction(pass, call)
+	if calledFn == nil {
+		return
+	}
+
+	var checkedFact ParameterCheckedErrorsFact
+	if pass.ImportObjectFact(calledFn, &checkedFact) {
+		markPartialCheckedErrors(state, &checkedFact, argIndex)
+	}
+}
+
+// markPartialCheckedErrors marks specific errors as checked based on ParameterCheckedErrorsFact.
+func markPartialCheckedErrors(state *errorVarState, checkedFact *ParameterCheckedErrorsFact, argIndex int) {
+	checkedErrors := checkedFact.GetCheckedErrors(argIndex)
+	for _, checkedErr := range checkedErrors {
+		checkedKey := checkedErr.Key()
+		for _, errInfo := range state.errors {
+			if errInfo.Key() == checkedKey {
+				state.checked[checkedKey] = true
+			}
+		}
+	}
 }
 
 // reportUncheckedErrors reports any errors that haven't been checked.

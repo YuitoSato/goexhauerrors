@@ -23,6 +23,7 @@ func TestAnalyzer(t *testing.T) {
 		"nested",
 		"unexported",
 		"paramflow",
+		"functiontype",
 		"interfacecall",
 		"higherorder",
 		"crosspkg/errors",
