@@ -75,7 +75,7 @@ func AnalyzeFunctionReturns(pass *analysis.Pass, localErrs *detector.LocalErrors
 		changed := false
 
 		// Create SSA analyzer with current local facts
-		ssaAnalyzer := ssaanalysis.NewAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, interfaceImpls)
+		ssaAnalyzer := ssaanalysis.NewAnalyzer(pass, localErrs, localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls)
 
 		for _, fi := range funcs {
 			// Phase A: Detect parameter flow (for error-typed parameters)

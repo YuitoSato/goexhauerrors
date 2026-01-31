@@ -26,6 +26,13 @@ func PropagateDirectReturn() error { // want PropagateDirectReturn:`\[crosspkg/e
 	return cpkgerrors.GetError()
 }
 
+// PropagateViaHigherOrderNamedFunc wraps a cross-package higher-order function call
+// with a named function argument. The errors from the named function should propagate
+// through the FunctionParamCallFlowFact of RunWithCallback.
+func PropagateViaHigherOrderNamedFunc() error { // want PropagateViaHigherOrderNamedFunc:`\[crosspkg/errors.ErrCrossPkg\]`
+	return cpkgerrors.RunWithCallback(cpkgerrors.GetError)
+}
+
 // PropagateBothViaVar propagates both sentinel and custom error
 func PropagateBothViaVar(useCustom bool) error { // want PropagateBothViaVar:`\[crosspkg/errors.CrossPkgError, crosspkg/errors.ErrCrossPkg\]`
 	var err error

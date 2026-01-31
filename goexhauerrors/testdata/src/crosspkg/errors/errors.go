@@ -19,3 +19,8 @@ func GetError() error { // want GetError:`\[crosspkg/errors.ErrCrossPkg\]`
 func GetCustomError() error { // want GetCustomError:`\[crosspkg/errors.CrossPkgError\]`
 	return &CrossPkgError{Code: 500}
 }
+
+// RunWithCallback is a higher-order function that calls the provided function.
+func RunWithCallback(fn func() error) error { // want RunWithCallback:`\[call:0\]`
+	return fn()
+}

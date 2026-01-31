@@ -35,6 +35,34 @@ func BadCallerBoth() {
 	}
 }
 
+func BadCallerHigherOrder() {
+	err := middle.PropagateViaHigherOrderNamedFunc() // want "missing errors.Is check for crosspkg/errors.ErrCrossPkg"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func BadCallerDirectNamedFunc() {
+	err := cpkgerrors.RunWithCallback(cpkgerrors.GetError) // want "missing errors.Is check for crosspkg/errors.ErrCrossPkg"
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerDirectNamedFunc() {
+	err := cpkgerrors.RunWithCallback(cpkgerrors.GetError)
+	if errors.Is(err, cpkgerrors.ErrCrossPkg) {
+		println("cross pkg error")
+	}
+}
+
+func GoodCallerHigherOrder() {
+	err := middle.PropagateViaHigherOrderNamedFunc()
+	if errors.Is(err, cpkgerrors.ErrCrossPkg) {
+		println("cross pkg error")
+	}
+}
+
 func GoodCaller() {
 	err := middle.PropagateViaVar()
 	if errors.Is(err, cpkgerrors.ErrCrossPkg) {
