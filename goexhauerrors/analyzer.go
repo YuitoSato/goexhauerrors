@@ -45,7 +45,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	localErrors := detector.DetectLocalErrors(pass)
 
 	// Phase 2: Analyze function bodies for returns
-	localFacts, localParamFlowFacts, interfaceImpls := analyzer.AnalyzeFunctionReturns(pass, localErrors)
+	localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls := analyzer.AnalyzeFunctionReturns(pass, localErrors)
 
 	// Phase 2b: Analyze closures assigned to variables
 	analyzer.AnalyzeClosures(pass, localErrors)
@@ -54,10 +54,10 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	analyzer.AnalyzeParameterErrorChecks(pass)
 
 	// Phase 2d: Compute interface method facts (after ParameterCheckedErrorsFact is available)
-	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
+	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls)
 
 	// Phase 2e: Compute interface method facts for imported interfaces (DI pattern support)
-	analyzer.ComputeImportedInterfaceMethodFacts(pass, localFacts, interfaceImpls)
+	analyzer.ComputeImportedInterfaceMethodFacts(pass, localFacts, localCallFlowFacts, interfaceImpls)
 
 	// Phase 3: Check call sites for exhaustive errors.Is checks
 	checker.CheckCallSites(pass, interfaceImpls)

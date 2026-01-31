@@ -38,7 +38,7 @@ func runTestAnalyzer(pass *analysis.Pass) (interface{}, error) {
 	localErrors := detector.DetectLocalErrors(pass)
 
 	// Phase 2: Analyze function bodies for returns
-	localFacts, localParamFlowFacts, interfaceImpls := analyzer.AnalyzeFunctionReturns(pass, localErrors)
+	localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls := analyzer.AnalyzeFunctionReturns(pass, localErrors)
 
 	// Phase 2b: Analyze closures
 	analyzer.AnalyzeClosures(pass, localErrors)
@@ -47,7 +47,7 @@ func runTestAnalyzer(pass *analysis.Pass) (interface{}, error) {
 	analyzer.AnalyzeParameterErrorChecks(pass)
 
 	// Phase 2d: Compute interface method facts
-	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, interfaceImpls)
+	analyzer.ComputeInterfaceMethodFacts(pass, localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls)
 
 	// Phase 3: Check call sites (the phase under test)
 	checker.CheckCallSites(pass, interfaceImpls)

@@ -267,6 +267,13 @@ func (a *Analyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]boo
 		allErrors = append(allErrors, paramFlowErrs...)
 	}
 
+	// Check FunctionParamCallFlowFact on the interface method (exported as intersection of impls)
+	var callFlowFact facts.FunctionParamCallFlowFact
+	if a.pass.ImportObjectFact(ifaceMethod, &callFlowFact) {
+		callFlowErrs := a.resolveFunctionParamCallFlowForInvoke(call, &callFlowFact, visited, depth)
+		allErrors = append(allErrors, callFlowErrs...)
+	}
+
 	if hasIfaceFact {
 		return a.deduplicateErrors(allErrors)
 	}
@@ -292,6 +299,35 @@ func (a *Analyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]boo
 		var fnFact facts.FunctionErrorsFact
 		if a.pass.ImportObjectFact(method, &fnFact) {
 			allErrors = append(allErrors, fnFact.Errors...)
+		}
+	}
+
+	// If no FunctionParamCallFlowFact was found on the interface method, compute intersection from impls
+	if !a.pass.ImportObjectFact(ifaceMethod, &callFlowFact) && len(implementingTypes) > 0 {
+		var implCallFlowFacts []*facts.FunctionParamCallFlowFact
+		for _, concreteType := range implementingTypes {
+			method := internal.FindMethodImplementation(concreteType, ifaceMethod)
+			if method == nil {
+				continue
+			}
+			var cf *facts.FunctionParamCallFlowFact
+			if localCF, ok := a.LocalCallFlowFacts[method]; ok {
+				cf = localCF
+			}
+			var importedCF facts.FunctionParamCallFlowFact
+			if a.pass.ImportObjectFact(method, &importedCF) {
+				if cf == nil {
+					cf = &importedCF
+				} else {
+					cf.Merge(&importedCF)
+				}
+			}
+			implCallFlowFacts = append(implCallFlowFacts, cf)
+		}
+		intersectedCallFlow := facts.IntersectFunctionParamCallFlowFacts(implCallFlowFacts)
+		if intersectedCallFlow != nil {
+			callFlowErrs := a.resolveFunctionParamCallFlowForInvoke(call, intersectedCallFlow, visited, depth)
+			allErrors = append(allErrors, callFlowErrs...)
 		}
 	}
 
@@ -373,6 +409,31 @@ func (a *Analyzer) resolveParameterFlowErrorsForStaticCall(call *ssa.Call, flowF
 		}
 
 		argErrs := a.traceValueToErrors(args[argIdx], visited, depth+1)
+		for i := range argErrs {
+			if flow.Wrapped {
+				argErrs[i].Wrapped = true
+			}
+		}
+		errs = append(errs, argErrs...)
+	}
+
+	return errs
+}
+
+// resolveFunctionParamCallFlowForInvoke resolves errors from function-typed arguments
+// passed to an interface method call (invoke mode) based on FunctionParamCallFlowFact.
+// In invoke mode, call.Call.Args contains only method arguments (no receiver).
+func (a *Analyzer) resolveFunctionParamCallFlowForInvoke(call *ssa.Call, callFlowFact *facts.FunctionParamCallFlowFact, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
+	var errs []facts.ErrorInfo
+	args := call.Call.Args
+
+	for _, flow := range callFlowFact.CallFlows {
+		argIdx := flow.ParamIndex
+		if argIdx >= len(args) {
+			continue
+		}
+
+		argErrs := a.getErrorsFromFunctionValue(args[argIdx], visited, depth+1)
 		for i := range argErrs {
 			if flow.Wrapped {
 				argErrs[i].Wrapped = true

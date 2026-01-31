@@ -18,3 +18,7 @@ func (r *RepositoryImpl) Save(id string, value string) error { // want Save:`\[c
 	}
 	return nil
 }
+
+func (r *RepositoryImpl) RunInTx(fn func() error) error { // want RunInTx:`\[call:0\]`
+	return fn()
+}

@@ -68,3 +68,23 @@ func (uc *GetUseCase) GoodCallerSave(id string, value string) error {
 	}
 	return nil
 }
+
+// BadCallerRunInTx does not check errors from higher-order call — should warn.
+func (uc *GetUseCase) BadCallerRunInTx() {
+	err := uc.repo.RunInTx(func() error { // want "missing errors.Is check for crosspkgdi/domain.ErrNotFound"
+		return domain.ErrNotFound
+	})
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+// GoodCallerRunInTx checks errors properly — no warning.
+func (uc *GetUseCase) GoodCallerRunInTx() {
+	err := uc.repo.RunInTx(func() error {
+		return domain.ErrNotFound
+	})
+	if errors.Is(err, domain.ErrNotFound) {
+		log.Println("not found")
+	}
+}

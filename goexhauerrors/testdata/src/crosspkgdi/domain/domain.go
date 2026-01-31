@@ -27,4 +27,5 @@ func Validate(id string) error { // want Validate:`\[crosspkgdi/domain.ErrNotFou
 type Repository interface {
 	FindByID(id string) (string, error)
 	Save(id string, value string) error
+	RunInTx(fn func() error) error
 }

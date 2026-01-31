@@ -43,6 +43,64 @@ func LoadInterfaceMethodFact(key string) (*InterfaceMethodFact, bool) {
 	return fact, ok
 }
 
+// globalCallFlowStore is a process-wide store for FunctionParamCallFlowFact.
+// It allows cross-package higher-order function call flow tracking (DI pattern).
+var globalCallFlowStore = &GlobalCallFlowStore{
+	store: make(map[string]*FunctionParamCallFlowFact),
+}
+
+// GlobalCallFlowStore stores FunctionParamCallFlowFact across packages.
+// Uses intersection semantics: a call flow is kept only if ALL implementations have it.
+type GlobalCallFlowStore struct {
+	mu    sync.RWMutex
+	store map[string]*FunctionParamCallFlowFact
+}
+
+// MergeCallFlowFact merges a FunctionParamCallFlowFact into the global store.
+// Uses intersection semantics: only call flows present in ALL implementations are kept.
+func MergeCallFlowFact(key string, fact *FunctionParamCallFlowFact) {
+	globalCallFlowStore.mu.Lock()
+	defer globalCallFlowStore.mu.Unlock()
+
+	if fact == nil || len(fact.CallFlows) == 0 {
+		// Implementation has no call flow -> intersection is empty
+		globalCallFlowStore.store[key] = &FunctionParamCallFlowFact{}
+		return
+	}
+
+	existing, ok := globalCallFlowStore.store[key]
+	if !ok {
+		// First implementation: deep copy
+		copied := &FunctionParamCallFlowFact{}
+		copied.Merge(fact)
+		globalCallFlowStore.store[key] = copied
+		return
+	}
+
+	// Already empty from a previous intersection
+	if len(existing.CallFlows) == 0 {
+		return
+	}
+
+	// Intersect: keep only flows present in both
+	var intersected []FunctionParamCallFlowInfo
+	for _, flow := range existing.CallFlows {
+		if fact.HasCallFlowForParam(flow.ParamIndex) {
+			intersected = append(intersected, flow)
+		}
+	}
+	existing.CallFlows = intersected
+}
+
+// LoadCallFlowFact loads the FunctionParamCallFlowFact for the given key.
+func LoadCallFlowFact(key string) (*FunctionParamCallFlowFact, bool) {
+	globalCallFlowStore.mu.RLock()
+	defer globalCallFlowStore.mu.RUnlock()
+
+	fact, ok := globalCallFlowStore.store[key]
+	return fact, ok
+}
+
 // DeferredFunctionCheck stores the context needed to re-analyze a function
 // whose checker couldn't resolve an interface method via the global store.
 type DeferredFunctionCheck struct {
@@ -91,12 +149,16 @@ func ProcessDeferredFunctionChecks() {
 // ResetGlobalStore clears the global store and deferred checks. Used in tests.
 func ResetGlobalStore() {
 	globalInterfaceMethodStore.mu.Lock()
-	defer globalInterfaceMethodStore.mu.Unlock()
 	globalInterfaceMethodStore.store = make(map[string]*InterfaceMethodFact)
+	globalInterfaceMethodStore.mu.Unlock()
+
+	globalCallFlowStore.mu.Lock()
+	globalCallFlowStore.store = make(map[string]*FunctionParamCallFlowFact)
+	globalCallFlowStore.mu.Unlock()
 
 	deferredChecks.mu.Lock()
-	defer deferredChecks.mu.Unlock()
 	deferredChecks.items = nil
+	deferredChecks.mu.Unlock()
 }
 
 // InterfaceMethodKey builds a key for the global store from package path, type name, and method name.

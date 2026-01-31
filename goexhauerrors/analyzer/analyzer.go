@@ -25,7 +25,7 @@ type funcInfo struct {
 // It uses iterative analysis to handle factory functions that call other
 // functions returning errors, combined with SSA-based analysis to track
 // errors through variables.
-func AnalyzeFunctionReturns(pass *analysis.Pass, localErrs *detector.LocalErrors) (map[*types.Func]*facts.FunctionErrorsFact, map[*types.Func]*facts.ParameterFlowFact, *internal.InterfaceImplementations) {
+func AnalyzeFunctionReturns(pass *analysis.Pass, localErrs *detector.LocalErrors) (map[*types.Func]*facts.FunctionErrorsFact, map[*types.Func]*facts.ParameterFlowFact, map[*types.Func]*facts.FunctionParamCallFlowFact, *internal.InterfaceImplementations) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// Discover interface implementations in this package
@@ -169,7 +169,7 @@ func AnalyzeFunctionReturns(pass *analysis.Pass, localErrs *detector.LocalErrors
 	}
 
 	// Return data needed for interface method facts (computed after AnalyzeParameterErrorChecks)
-	return localFacts, localParamFlowFacts, interfaceImpls
+	return localFacts, localParamFlowFacts, localCallFlowFacts, interfaceImpls
 }
 
 // buildValidErrors creates a set of valid error keys that can be used in FunctionErrorsFact.
@@ -628,11 +628,11 @@ func analyzeClosureValueSpec(pass *analysis.Pass, spec *ast.ValueSpec, localErrs
 }
 
 // ComputeInterfaceMethodFacts computes and exports InterfaceMethodFact, ParameterFlowFact,
-// and ParameterCheckedErrorsFact for each interface method in the package.
+// FunctionParamCallFlowFact, and ParameterCheckedErrorsFact for each interface method in the package.
 // It collects errors from all known implementations.
-// For ParameterFlowFact and ParameterCheckedErrorsFact, intersection semantics is used
-// (a fact is only exported if ALL implementations agree).
-func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, impls *internal.InterfaceImplementations) {
+// For ParameterFlowFact, FunctionParamCallFlowFact, and ParameterCheckedErrorsFact,
+// intersection semantics is used (a fact is only exported if ALL implementations agree).
+func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, localParamFlowFacts map[*types.Func]*facts.ParameterFlowFact, localCallFlowFacts map[*types.Func]*facts.FunctionParamCallFlowFact, impls *internal.InterfaceImplementations) {
 	scope := pass.Pkg.Scope()
 
 	// For each interface defined in this package
@@ -659,6 +659,7 @@ func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 
 			fact := &facts.InterfaceMethodFact{}
 			var allParamFlowFacts []*facts.ParameterFlowFact
+			var allCallFlowFacts []*facts.FunctionParamCallFlowFact
 			var allCheckedFacts []*facts.ParameterCheckedErrorsFact
 
 			// Collect facts from all implementations
@@ -693,6 +694,21 @@ func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 				}
 				allParamFlowFacts = append(allParamFlowFacts, pf)
 
+				// FunctionParamCallFlowFact (collect for intersection)
+				var pcf *facts.FunctionParamCallFlowFact
+				if localCF, ok := localCallFlowFacts[method]; ok {
+					pcf = localCF
+				}
+				var importedPCF facts.FunctionParamCallFlowFact
+				if pass.ImportObjectFact(method, &importedPCF) {
+					if pcf == nil {
+						pcf = &importedPCF
+					} else {
+						pcf.Merge(&importedPCF)
+					}
+				}
+				allCallFlowFacts = append(allCallFlowFacts, pcf)
+
 				// ParameterCheckedErrorsFact (collect for intersection)
 				var cf *facts.ParameterCheckedErrorsFact
 				var importedCF facts.ParameterCheckedErrorsFact
@@ -715,6 +731,14 @@ func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 				}
 			}
 
+			// Export FunctionParamCallFlowFact (intersection across implementations)
+			if len(allCallFlowFacts) > 0 {
+				intersectedCallFlow := facts.IntersectFunctionParamCallFlowFacts(allCallFlowFacts)
+				if intersectedCallFlow != nil && len(intersectedCallFlow.CallFlows) > 0 {
+					pass.ExportObjectFact(ifaceMethod, intersectedCallFlow)
+				}
+			}
+
 			// Export ParameterCheckedErrorsFact (intersection across implementations)
 			if len(allCheckedFacts) > 0 {
 				intersectedChecked := facts.IntersectParameterCheckedErrorsFacts(allCheckedFacts)
@@ -726,13 +750,14 @@ func ComputeInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func
 	}
 }
 
-// ComputeImportedInterfaceMethodFacts computes InterfaceMethodFact for interfaces
-// defined in imported packages, using implementations found in the current package.
+// ComputeImportedInterfaceMethodFacts computes InterfaceMethodFact and
+// FunctionParamCallFlowFact for interfaces defined in imported packages,
+// using implementations found in the current package.
 // This handles the DI pattern where the interface is in package A (e.g., domain),
 // the implementation is in package B (e.g., infra), and the caller is in package C
 // (e.g., usecase) which imports A but not B. By storing facts in a global store
 // from B, C can later look them up even without importing B.
-func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, impls *internal.InterfaceImplementations) {
+func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*types.Func]*facts.FunctionErrorsFact, localCallFlowFacts map[*types.Func]*facts.FunctionParamCallFlowFact, impls *internal.InterfaceImplementations) {
 	for _, imp := range pass.Pkg.Imports() {
 		impScope := imp.Scope()
 		for _, name := range impScope.Names() {
@@ -757,6 +782,7 @@ func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*ty
 				ifaceMethod := ifaceType.Method(i)
 
 				fact := &facts.InterfaceMethodFact{}
+				var allCallFlowFacts []*facts.FunctionParamCallFlowFact
 
 				for _, concreteType := range implementingTypes {
 					method := internal.FindMethodImplementation(concreteType, ifaceMethod)
@@ -764,7 +790,7 @@ func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*ty
 						continue
 					}
 
-					// Collect errors from local implementations
+					// Collect errors from local implementations (union)
 					if localFact, ok := localFacts[method]; ok {
 						fact.AddErrors(localFact.Errors)
 					}
@@ -772,12 +798,34 @@ func ComputeImportedInterfaceMethodFacts(pass *analysis.Pass, localFacts map[*ty
 					if pass.ImportObjectFact(method, &fnFact) {
 						fact.AddErrors(fnFact.Errors)
 					}
+
+					// Collect FunctionParamCallFlowFact (for intersection)
+					var pcf *facts.FunctionParamCallFlowFact
+					if localCF, ok := localCallFlowFacts[method]; ok {
+						pcf = localCF
+					}
+					var importedCF facts.FunctionParamCallFlowFact
+					if pass.ImportObjectFact(method, &importedCF) {
+						if pcf == nil {
+							pcf = &importedCF
+						} else {
+							pcf.Merge(&importedCF)
+						}
+					}
+					allCallFlowFacts = append(allCallFlowFacts, pcf)
 				}
+
+				key := facts.InterfaceMethodKey(imp.Path(), typeName.Name(), ifaceMethod.Name())
 
 				if len(fact.Errors) > 0 {
 					// Store in global store so callers that don't import this package can find it
-					key := facts.InterfaceMethodKey(imp.Path(), typeName.Name(), ifaceMethod.Name())
 					facts.MergeInterfaceMethodFact(key, fact)
+				}
+
+				// Store FunctionParamCallFlowFact in global store (intersection semantics)
+				if len(allCallFlowFacts) > 0 {
+					intersected := facts.IntersectFunctionParamCallFlowFacts(allCallFlowFacts)
+					facts.MergeCallFlowFact(key, intersected)
 				}
 			}
 		}
