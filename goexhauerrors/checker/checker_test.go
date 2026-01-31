@@ -79,3 +79,8 @@ func TestCheckerPartial(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, testAnalyzer, "partial")
 }
+
+func TestCheckerSwitchPropagation(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, testAnalyzer, "switch_propagation")
+}
