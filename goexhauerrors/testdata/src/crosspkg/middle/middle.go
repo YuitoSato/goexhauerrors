@@ -33,6 +33,13 @@ func PropagateViaHigherOrderNamedFunc() error { // want PropagateViaHigherOrderN
 	return cpkgerrors.RunWithCallback(cpkgerrors.GetError)
 }
 
+// TransitiveHigherOrderWrapper is a transitive wrapper that passes fn to a
+// cross-package higher-order function instead of calling it directly.
+// This tests ImportObjectFact path for FunctionParamCallFlowFact.
+func TransitiveHigherOrderWrapper(fn func() error) error { // want TransitiveHigherOrderWrapper:`\[call:0\]`
+	return cpkgerrors.RunWithCallback(fn)
+}
+
 // PropagateBothViaVar propagates both sentinel and custom error
 func PropagateBothViaVar(useCustom bool) error { // want PropagateBothViaVar:`\[crosspkg/errors.CrossPkgError, crosspkg/errors.ErrCrossPkg\]`
 	var err error

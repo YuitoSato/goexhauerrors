@@ -63,6 +63,26 @@ func GoodCallerHigherOrder() {
 	}
 }
 
+// BadCallerTransitiveHigherOrder tests cross-package transitive FunctionParamCallFlowFact.
+// middle.TransitiveHigherOrderWrapper passes fn to cpkgerrors.RunWithCallback transitively.
+func BadCallerTransitiveHigherOrder() {
+	err := middle.TransitiveHigherOrderWrapper(func() error { // want "missing errors.Is check for crosspkg/errors.ErrCrossPkg"
+		return cpkgerrors.ErrCrossPkg
+	})
+	if err != nil {
+		println(err.Error())
+	}
+}
+
+func GoodCallerTransitiveHigherOrder() {
+	err := middle.TransitiveHigherOrderWrapper(func() error {
+		return cpkgerrors.ErrCrossPkg
+	})
+	if errors.Is(err, cpkgerrors.ErrCrossPkg) {
+		println("cross pkg error")
+	}
+}
+
 func GoodCaller() {
 	err := middle.PropagateViaVar()
 	if errors.Is(err, cpkgerrors.ErrCrossPkg) {
