@@ -41,6 +41,9 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgiface/caller",
 		"crosspkgunexported/errors",
 		"crosspkgunexported/caller",
+		"crosspkgdi/domain",
+		"crosspkgdi/infra",
+		"crosspkgdi/usecase",
 	)
 }
 
