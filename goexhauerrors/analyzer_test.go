@@ -39,6 +39,8 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgiface/iface",
 		"crosspkgiface/impl",
 		"crosspkgiface/caller",
+		"crosspkgunexported/errors",
+		"crosspkgunexported/caller",
 	)
 }
 

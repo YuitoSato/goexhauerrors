@@ -629,6 +629,11 @@ func reportUncheckedErrors(pass *analysis.Pass, state *errorVarState) {
 		if internal.ShouldIgnorePackage(errInfo.PkgPath) {
 			continue
 		}
+		// Skip unexported errors from other packages.
+		// These cannot be checked with errors.Is/errors.As from outside the package.
+		if errInfo.PkgPath != pass.Pkg.Path() && !token.IsExported(errInfo.Name) {
+			continue
+		}
 		key := errInfo.Key()
 		if !state.checked[key] {
 			pass.Reportf(state.callPos, "missing errors.Is check for %s", key)
