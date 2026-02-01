@@ -170,11 +170,7 @@ func isErrorOrImplementsError(t types.Type) bool {
 	}
 	// Also check pointer to the type
 	ptrType := types.NewPointer(t)
-	if types.Implements(ptrType, errorInterface) {
-		return true
-	}
-
-	return false
+	return types.Implements(ptrType, errorInterface)
 }
 
 // isCallSentinelInit checks if the expression is a function call sentinel init.
@@ -222,11 +218,7 @@ func isErrorCompositeLiteral(pass *analysis.Pass, expr ast.Expr) bool {
 		return true
 	}
 	ptrType := types.NewPointer(litType)
-	if types.Implements(ptrType, errorInterface) {
-		return true
-	}
-
-	return false
+	return types.Implements(ptrType, errorInterface)
 }
 
 // isErrorsNewCall checks if the call is errors.New().
