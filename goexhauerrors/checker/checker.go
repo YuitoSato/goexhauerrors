@@ -885,26 +885,13 @@ func (csa *CallSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*facts.FunctionE
 // getInterfaceMethodErrors returns errors from an interface method call.
 // It checks if the receiver is an interface type and returns the InterfaceMethodFact.
 func (csa *CallSiteAnalyzer) getInterfaceMethodErrors(sel *ast.SelectorExpr) (*facts.FunctionErrorsFact, *types.Signature) {
+	ifaceType, method := csa.resolveInterfaceMethod(sel)
+	if ifaceType == nil {
+		return nil, nil
+	}
+
 	pass := csa.Pass
-	// Check if the receiver is an interface type
-	tv := pass.TypesInfo.Types[sel.X]
-	if !tv.IsValue() {
-		return nil, nil
-	}
 
-	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
-	if !ok {
-		return nil, nil
-	}
-
-	// Get the method object
-	methodObj := pass.TypesInfo.Uses[sel.Sel]
-	method, ok := methodObj.(*types.Func)
-	if !ok {
-		return nil, nil
-	}
-
-	// Get the method signature
 	sig, ok := method.Type().(*types.Signature)
 	if !ok {
 		return nil, nil
@@ -983,30 +970,40 @@ func findInterfaceTypeNameInScope(scope *types.Scope, ifaceType *types.Interface
 	return nil
 }
 
-// getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
-// from all implementations of an interface method.
-// Returns nil if the receiver is not an interface type or no implementations have flow facts.
-func (csa *CallSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorExpr) *facts.ParameterFlowFact {
-	pass := csa.Pass
-	tv := pass.TypesInfo.Types[sel.X]
+// resolveInterfaceMethod resolves the interface type and method from a selector expression.
+// Returns nil for both if the receiver is not an interface type.
+func (csa *CallSiteAnalyzer) resolveInterfaceMethod(sel *ast.SelectorExpr) (*types.Interface, *types.Func) {
+	tv := csa.Pass.TypesInfo.Types[sel.X]
 	if !tv.IsValue() {
-		return nil
+		return nil, nil
 	}
 
 	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
-	methodObj := pass.TypesInfo.Uses[sel.Sel]
+	methodObj := csa.Pass.TypesInfo.Uses[sel.Sel]
 	method, ok := methodObj.(*types.Func)
 	if !ok {
+		return nil, nil
+	}
+
+	return ifaceType, method
+}
+
+// getInterfaceMethodParameterFlow returns the intersection of ParameterFlowFact
+// from all implementations of an interface method.
+// Returns nil if the receiver is not an interface type or no implementations have flow facts.
+func (csa *CallSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorExpr) *facts.ParameterFlowFact {
+	ifaceType, method := csa.resolveInterfaceMethod(sel)
+	if ifaceType == nil {
 		return nil
 	}
 
 	// Check for ParameterFlowFact directly on the interface method
 	var flowFact facts.ParameterFlowFact
-	if pass.ImportObjectFact(method, &flowFact) {
+	if csa.Pass.ImportObjectFact(method, &flowFact) {
 		return &flowFact
 	}
 
@@ -1023,7 +1020,7 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorEx
 			continue
 		}
 		var pf facts.ParameterFlowFact
-		if pass.ImportObjectFact(concreteMethod, &pf) {
+		if csa.Pass.ImportObjectFact(concreteMethod, &pf) {
 			allFlowFacts = append(allFlowFacts, &pf)
 		} else {
 			allFlowFacts = append(allFlowFacts, nil)
@@ -1037,26 +1034,14 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodParameterFlow(sel *ast.SelectorEx
 // from all implementations of an interface method.
 // Returns nil if the receiver is not an interface type or no implementations have checked facts.
 func (csa *CallSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorExpr) *facts.ParameterCheckedErrorsFact {
-	pass := csa.Pass
-	tv := pass.TypesInfo.Types[sel.X]
-	if !tv.IsValue() {
-		return nil
-	}
-
-	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
-	if !ok {
-		return nil
-	}
-
-	methodObj := pass.TypesInfo.Uses[sel.Sel]
-	method, ok := methodObj.(*types.Func)
-	if !ok {
+	ifaceType, method := csa.resolveInterfaceMethod(sel)
+	if ifaceType == nil {
 		return nil
 	}
 
 	// Check for ParameterCheckedErrorsFact directly on the interface method
 	var checkedFact facts.ParameterCheckedErrorsFact
-	if pass.ImportObjectFact(method, &checkedFact) {
+	if csa.Pass.ImportObjectFact(method, &checkedFact) {
 		return &checkedFact
 	}
 
@@ -1073,7 +1058,7 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorEx
 			continue
 		}
 		var cf facts.ParameterCheckedErrorsFact
-		if pass.ImportObjectFact(concreteMethod, &cf) {
+		if csa.Pass.ImportObjectFact(concreteMethod, &cf) {
 			allCheckedFacts = append(allCheckedFacts, &cf)
 		} else {
 			allCheckedFacts = append(allCheckedFacts, nil)
