@@ -45,6 +45,7 @@ func TestAnalyzer(t *testing.T) {
 		"crosspkgdi/infra",
 		"crosspkgdi/usecase",
 		"ifacehigherorder",
+		"falsenegative",
 	)
 }
 

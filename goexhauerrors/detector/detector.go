@@ -31,7 +31,8 @@ func NewLocalErrors() *LocalErrors {
 // DetectLocalErrors finds local errors in the current package and exports facts.
 // It detects:
 // 1. var Err* = errors.New("...") pattern (sentinel errors)
-// 2. Custom error types (structs implementing error interface)
+// 2. var Err* = &ErrorType{...} pattern (composite literal sentinels)
+// 3. Custom error types (structs implementing error interface)
 func DetectLocalErrors(pass *analysis.Pass) *LocalErrors {
 	result := NewLocalErrors()
 
@@ -76,14 +77,29 @@ func detectSentinelVars(pass *analysis.Pass, insp *inspector.Inspector, result *
 					continue
 				}
 
-				// Check if type is error
-				if !internal.IsErrorType(varObj.Type()) {
+				// Check if type is error interface or implements error
+				if !isErrorOrImplementsError(varObj.Type()) {
 					continue
 				}
 
 				// Check initialization pattern
 				if i < len(valueSpec.Values) {
-					if isSentinelInit(pass, valueSpec.Values[i]) {
+					initExpr := valueSpec.Values[i]
+					isCallInit := isCallSentinelInit(pass, initExpr)
+					isCompositeLit := isErrorCompositeLiteral(pass, initExpr)
+
+					if isCallInit || isCompositeLit {
+						// For composite literal inits where the variable type is a
+						// concrete error type (not the error interface), skip adding
+						// to Vars. MakeInterface in SSA will detect these at the type
+						// level via LocalErrs.Types instead.
+						// Only add composite literal inits when the variable is declared
+						// as the error interface (e.g., var Err error = &MyError{...}),
+						// since SSA won't have a MakeInterface for those.
+						if isCompositeLit && !isCallInit && !internal.IsErrorType(varObj.Type()) {
+							continue
+						}
+
 						result.Vars[varObj] = true
 						// Only export fact for exported errors (cross-package analysis)
 						if token.IsExported(name.Name) {
@@ -139,23 +155,74 @@ func detectCustomErrorTypes(pass *analysis.Pass, result *LocalErrors) {
 	}
 }
 
-// isSentinelInit checks if the expression is a sentinel error initialization.
+// isErrorOrImplementsError checks if the type is the error interface
+// or if it implements the error interface (for concrete error types).
+func isErrorOrImplementsError(t types.Type) bool {
+	// Check if it's the error interface itself
+	if internal.IsErrorType(t) {
+		return true
+	}
+
+	// Check if the type implements the error interface
+	errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	if types.Implements(t, errorInterface) {
+		return true
+	}
+	// Also check pointer to the type
+	ptrType := types.NewPointer(t)
+	if types.Implements(ptrType, errorInterface) {
+		return true
+	}
+
+	return false
+}
+
+// isCallSentinelInit checks if the expression is a function call sentinel init.
 // Supported patterns:
 // - errors.New("...")
 // - fmt.Errorf("...") without %w
-func isSentinelInit(pass *analysis.Pass, expr ast.Expr) bool {
+func isCallSentinelInit(pass *analysis.Pass, expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
 	}
-
-	// Check for errors.New("...")
 	if isErrorsNewCall(pass, call) {
 		return true
 	}
-
-	// Check for fmt.Errorf("...") without %w
 	if isFmtErrorfWithoutWrap(pass, call) {
+		return true
+	}
+	return false
+}
+
+// isErrorCompositeLiteral checks if the expression is a composite literal
+// (or address-of composite literal) of a type that implements error.
+// This covers patterns like: var ErrFoo = &MyError{Code: 404}
+func isErrorCompositeLiteral(pass *analysis.Pass, expr ast.Expr) bool {
+	errorInterface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+
+	// Handle &Type{...}
+	if unary, ok := expr.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+		expr = unary.X
+	}
+
+	comp, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+
+	// Get the type of the composite literal
+	litType := pass.TypesInfo.TypeOf(comp)
+	if litType == nil {
+		return false
+	}
+
+	// Check if the type (or pointer to it) implements error
+	if types.Implements(litType, errorInterface) {
+		return true
+	}
+	ptrType := types.NewPointer(litType)
+	if types.Implements(ptrType, errorInterface) {
 		return true
 	}
 
