@@ -1,4 +1,4 @@
-package falsenegative
+package compositelit
 
 import (
 	"errors"
@@ -10,7 +10,7 @@ import (
 // Exported custom error type with struct literal sentinels
 // =============================================================================
 
-type HTTPError struct { // want HTTPError:`falsenegative.HTTPError`
+type HTTPError struct { // want HTTPError:`compositelit.HTTPError`
 	Code    int
 	Message string
 }
@@ -23,7 +23,7 @@ var ErrNotFound = &HTTPError{Code: 404, Message: "not found"}
 var ErrBadRequest = &HTTPError{Code: 400, Message: "bad request"}
 
 // GetUser returns ErrNotFound (struct literal sentinel, NOT errors.New)
-func GetUser(id string) (*string, error) { // want GetUser:`\[falsenegative.HTTPError\]`
+func GetUser(id string) (*string, error) { // want GetUser:`\[compositelit.HTTPError\]`
 	if id == "" {
 		return nil, ErrNotFound
 	}
@@ -32,7 +32,7 @@ func GetUser(id string) (*string, error) { // want GetUser:`\[falsenegative.HTTP
 }
 
 // GetOrder returns ErrNotFound or ErrBadRequest
-func GetOrder(id string) (*string, error) { // want GetOrder:`\[falsenegative.HTTPError\]`
+func GetOrder(id string) (*string, error) { // want GetOrder:`\[compositelit.HTTPError\]`
 	if id == "" {
 		return nil, ErrNotFound
 	}
@@ -45,7 +45,7 @@ func GetOrder(id string) (*string, error) { // want GetOrder:`\[falsenegative.HT
 
 // BadCallerStructLiteral does not check for HTTPError type
 func BadCallerStructLiteral() {
-	_, err := GetUser("") // want "missing errors.Is check for falsenegative.HTTPError"
+	_, err := GetUser("") // want "missing errors.Is check for compositelit.HTTPError"
 	if err != nil {
 		println(err.Error())
 	}
@@ -77,7 +77,7 @@ var ErrUnauthorized = &httpErr{statusCode: 401}
 var ErrForbidden = &httpErr{statusCode: 403}
 
 // Authenticate returns ErrUnauthorized or ErrForbidden
-func Authenticate(token string) error { // want Authenticate:`\[falsenegative.httpErr\]`
+func Authenticate(token string) error { // want Authenticate:`\[compositelit.httpErr\]`
 	if token == "" {
 		return ErrUnauthorized
 	}
@@ -89,7 +89,7 @@ func Authenticate(token string) error { // want Authenticate:`\[falsenegative.ht
 
 // BadCallerUnexportedType does not check at all
 func BadCallerUnexportedType() {
-	err := Authenticate("") // want "missing errors.Is check for falsenegative.httpErr"
+	err := Authenticate("") // want "missing errors.Is check for compositelit.httpErr"
 	if err != nil {
 		println(err.Error())
 	}
@@ -110,14 +110,14 @@ func GoodCallerUnexportedType() {
 // This was a false negative before the composite literal detection fix.
 // =============================================================================
 
-var ErrTypedAsError error = &HTTPError{Code: 500, Message: "internal"} // want ErrTypedAsError:`falsenegative.ErrTypedAsError`
+var ErrTypedAsError error = &HTTPError{Code: 500, Message: "internal"} // want ErrTypedAsError:`compositelit.ErrTypedAsError`
 
-func GetInternalError() error { // want GetInternalError:`\[falsenegative.ErrTypedAsError\]`
+func GetInternalError() error { // want GetInternalError:`\[compositelit.ErrTypedAsError\]`
 	return ErrTypedAsError
 }
 
 func BadCallerErrorTyped() {
-	err := GetInternalError() // want "missing errors.Is check for falsenegative.ErrTypedAsError"
+	err := GetInternalError() // want "missing errors.Is check for compositelit.ErrTypedAsError"
 	if err != nil {
 		println(err.Error())
 	}
@@ -159,7 +159,7 @@ func BadCallerCustomInit() {
 // The linter reports at type level (HTTPError), not variable level.
 // =============================================================================
 
-func GetOrderBad(id string) error { // want GetOrderBad:`\[falsenegative.HTTPError\]`
+func GetOrderBad(id string) error { // want GetOrderBad:`\[compositelit.HTTPError\]`
 	if id == "" {
 		return ErrNotFound
 	}
@@ -182,9 +182,9 @@ func CallerChecksSameType() {
 // Pattern 6: Sentinel + struct literal sentinel mix
 // =============================================================================
 
-var ErrSentinel = errors.New("sentinel") // want ErrSentinel:`falsenegative.ErrSentinel`
+var ErrSentinel = errors.New("sentinel") // want ErrSentinel:`compositelit.ErrSentinel`
 
-func MixedReturns(flag int) error { // want MixedReturns:`\[falsenegative.ErrSentinel, falsenegative.HTTPError\]`
+func MixedReturns(flag int) error { // want MixedReturns:`\[compositelit.ErrSentinel, compositelit.HTTPError\]`
 	switch flag {
 	case 1:
 		return ErrSentinel
@@ -196,14 +196,14 @@ func MixedReturns(flag int) error { // want MixedReturns:`\[falsenegative.ErrSen
 }
 
 func BadCallerMixed() {
-	err := MixedReturns(1) // want "missing errors.Is check for falsenegative.ErrSentinel" "missing errors.Is check for falsenegative.HTTPError"
+	err := MixedReturns(1) // want "missing errors.Is check for compositelit.ErrSentinel" "missing errors.Is check for compositelit.HTTPError"
 	if err != nil {
 		println(err.Error())
 	}
 }
 
 func PartialCallerMixed() {
-	err := MixedReturns(1) // want "missing errors.Is check for falsenegative.HTTPError"
+	err := MixedReturns(1) // want "missing errors.Is check for compositelit.HTTPError"
 	if errors.Is(err, ErrSentinel) {
 		println("sentinel")
 	}
@@ -240,7 +240,7 @@ func BadCallerWrap() {
 // =============================================================================
 
 func CallerTypeAssertionDirect() {
-	_, err := GetUser("") // want "missing errors.Is check for falsenegative.HTTPError"
+	_, err := GetUser("") // want "missing errors.Is check for compositelit.HTTPError"
 	if _, ok := err.(*HTTPError); ok {
 		println("http error")
 	}
