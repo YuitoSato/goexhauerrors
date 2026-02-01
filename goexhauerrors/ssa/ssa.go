@@ -179,64 +179,21 @@ func (a *Analyzer) getErrorsFromCall(call *ssa.Call, visited map[ssa.Value]bool,
 		return a.getErrorsFromInvoke(call, visited, depth)
 	}
 
-	var errs []facts.ErrorInfo
-
-	callee := call.Call.StaticCallee()
+	callee, typesFunc := resolveStaticCallee(call)
 	if callee == nil {
 		return nil
 	}
 
-	fn := callee.Object()
-	if fn == nil {
-		return nil
+	var errs []facts.ErrorInfo
+
+	errs = append(errs, a.lookupFunctionErrorsFact(typesFunc)...)
+
+	if flowFact := a.lookupParameterFlowFact(typesFunc); flowFact != nil {
+		errs = append(errs, a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee, visited, depth)...)
 	}
 
-	typesFunc, ok := fn.(*types.Func)
-	if !ok {
-		return nil
-	}
-
-	// Check local facts first (for same-package functions)
-	if localFact, ok := a.LocalFacts[typesFunc]; ok {
-		errs = append(errs, localFact.Errors...)
-	}
-
-	// Also check imported facts (for cross-package or already exported)
-	var fnFact facts.FunctionErrorsFact
-	if a.pass.ImportObjectFact(typesFunc, &fnFact) {
-		errs = append(errs, fnFact.Errors...)
-	}
-
-	// Also resolve errors through ParameterFlowFact for static calls
-	var flowFact *facts.ParameterFlowFact
-	if localPF, ok := a.LocalParamFlowFacts[typesFunc]; ok {
-		flowFact = localPF
-	}
-	var importedPF facts.ParameterFlowFact
-	if a.pass.ImportObjectFact(typesFunc, &importedPF) {
-		if flowFact == nil {
-			flowFact = &importedPF
-		}
-	}
-	if flowFact != nil {
-		paramFlowErrs := a.resolveParameterFlowErrorsForStaticCall(call, flowFact, callee, visited, depth)
-		errs = append(errs, paramFlowErrs...)
-	}
-
-	// Also resolve errors through FunctionParamCallFlowFact for higher-order function calls
-	var callFlowFact *facts.FunctionParamCallFlowFact
-	if localCF, ok := a.LocalCallFlowFacts[typesFunc]; ok {
-		callFlowFact = localCF
-	}
-	var importedCF facts.FunctionParamCallFlowFact
-	if a.pass.ImportObjectFact(typesFunc, &importedCF) {
-		if callFlowFact == nil {
-			callFlowFact = &importedCF
-		}
-	}
-	if callFlowFact != nil {
-		callFlowErrs := a.resolveFunctionParamCallFlowForStaticCall(call, callFlowFact, callee, visited, depth)
-		errs = append(errs, callFlowErrs...)
+	if callFlowFact := a.lookupCallFlowFact(typesFunc); callFlowFact != nil {
+		errs = append(errs, a.resolveFunctionParamCallFlowForStaticCall(call, callFlowFact, callee, visited, depth)...)
 	}
 
 	return errs
@@ -293,13 +250,7 @@ func (a *Analyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]boo
 		}
 
 		// FunctionErrorsFact
-		if localFact, ok := a.LocalFacts[method]; ok {
-			allErrors = append(allErrors, localFact.Errors...)
-		}
-		var fnFact facts.FunctionErrorsFact
-		if a.pass.ImportObjectFact(method, &fnFact) {
-			allErrors = append(allErrors, fnFact.Errors...)
-		}
+		allErrors = append(allErrors, a.lookupFunctionErrorsFact(method)...)
 	}
 
 	// If no FunctionParamCallFlowFact was found on the interface method, compute intersection from impls
@@ -339,19 +290,7 @@ func (a *Analyzer) getErrorsFromInvoke(call *ssa.Call, visited map[ssa.Value]boo
 			if method == nil {
 				continue
 			}
-			var pf *facts.ParameterFlowFact
-			if localPF, ok := a.LocalParamFlowFacts[method]; ok {
-				pf = localPF
-			}
-			var importedPF facts.ParameterFlowFact
-			if a.pass.ImportObjectFact(method, &importedPF) {
-				if pf == nil {
-					pf = &importedPF
-				} else {
-					pf.Merge(&importedPF)
-				}
-			}
-			implFlowFacts = append(implFlowFacts, pf)
+			implFlowFacts = append(implFlowFacts, a.lookupParameterFlowFact(method))
 		}
 		intersected := facts.IntersectParameterFlowFacts(implFlowFacts)
 		if intersected != nil {
@@ -524,139 +463,140 @@ func (a *Analyzer) getFunctionErrorsFact(fn *ssa.Function) []facts.ErrorInfo {
 	if !ok {
 		return nil
 	}
+	return a.lookupFunctionErrorsFact(typesFunc)
+}
 
+// lookupFunctionErrorsFact returns the FunctionErrorsFact for a types.Func,
+// checking local facts first, then imported facts.
+func (a *Analyzer) lookupFunctionErrorsFact(fn *types.Func) []facts.ErrorInfo {
 	var errs []facts.ErrorInfo
-
-	// Check local facts first
-	if localFact, ok := a.LocalFacts[typesFunc]; ok {
+	if localFact, ok := a.LocalFacts[fn]; ok {
 		errs = append(errs, localFact.Errors...)
 	}
+	var imported facts.FunctionErrorsFact
+	if a.pass.ImportObjectFact(fn, &imported) {
+		errs = append(errs, imported.Errors...)
+	}
+	return errs
+}
 
-	// Also check imported facts
-	var fnFact facts.FunctionErrorsFact
-	if a.pass.ImportObjectFact(typesFunc, &fnFact) {
-		errs = append(errs, fnFact.Errors...)
+// lookupParameterFlowFact returns the ParameterFlowFact for a types.Func,
+// checking local facts first, then imported facts.
+func (a *Analyzer) lookupParameterFlowFact(fn *types.Func) *facts.ParameterFlowFact {
+	var result *facts.ParameterFlowFact
+	if local, ok := a.LocalParamFlowFacts[fn]; ok {
+		result = local
+	}
+	var imported facts.ParameterFlowFact
+	if a.pass.ImportObjectFact(fn, &imported) {
+		if result == nil {
+			result = &imported
+		} else {
+			result.Merge(&imported)
+		}
+	}
+	return result
+}
+
+// lookupCallFlowFact returns the FunctionParamCallFlowFact for a types.Func,
+// checking local facts first, then imported facts.
+func (a *Analyzer) lookupCallFlowFact(fn *types.Func) *facts.FunctionParamCallFlowFact {
+	var result *facts.FunctionParamCallFlowFact
+	if local, ok := a.LocalCallFlowFacts[fn]; ok {
+		result = local
+	}
+	var imported facts.FunctionParamCallFlowFact
+	if a.pass.ImportObjectFact(fn, &imported) {
+		if result == nil {
+			result = &imported
+		}
+	}
+	return result
+}
+
+// resolveStaticCallee extracts the *types.Func from a static call.
+// Returns nil if the call is not a static call or the callee has no types.Func.
+func resolveStaticCallee(call *ssa.Call) (*ssa.Function, *types.Func) {
+	callee := call.Call.StaticCallee()
+	if callee == nil {
+		return nil, nil
+	}
+	fn := callee.Object()
+	if fn == nil {
+		return nil, nil
+	}
+	typesFunc, ok := fn.(*types.Func)
+	if !ok {
+		return nil, nil
+	}
+	return callee, typesFunc
+}
+
+// resolveErrorInfoFromTypeName checks if a *types.TypeName is a known custom error type
+// and returns the corresponding ErrorInfo. This is the common logic shared by
+// getErrorsFromMakeInterface and getErrorsFromAlloc.
+func (a *Analyzer) resolveErrorInfoFromTypeName(typeName *types.TypeName) []facts.ErrorInfo {
+	if typeName == nil {
+		return nil
 	}
 
-	return errs
+	pkg := typeName.Pkg()
+	if pkg == nil {
+		return nil
+	}
+
+	if internal.ShouldIgnorePackage(pkg.Path()) {
+		return nil
+	}
+
+	// Check if it's a local custom error type (same package)
+	if pkg.Path() == a.pass.Pkg.Path() {
+		if a.LocalErrs.Types[typeName] {
+			return []facts.ErrorInfo{{
+				PkgPath: a.pass.Pkg.Path(),
+				Name:    typeName.Name(),
+			}}
+		}
+		return nil
+	}
+
+	// For imported types, only use if they have an explicit fact
+	var errorFact facts.ErrorFact
+	if a.pass.ImportObjectFact(typeName, &errorFact) {
+		return []facts.ErrorInfo{{
+			PkgPath: errorFact.PkgPath,
+			Name:    errorFact.Name,
+		}}
+	}
+
+	return nil
 }
 
 // getErrorsFromMakeInterface checks if a MakeInterface creates a known custom error type.
 // Only returns errors if the type is explicitly registered as a error type.
 func (a *Analyzer) getErrorsFromMakeInterface(v *ssa.MakeInterface) []facts.ErrorInfo {
-	var errs []facts.ErrorInfo
-
-	// Get the concrete type being converted to interface
-	concreteType := v.X.Type()
-
-	// Extract the named type (handling pointers)
-	namedType := internal.ExtractNamedType(concreteType)
+	namedType := internal.ExtractNamedType(v.X.Type())
 	if namedType == nil {
 		return nil
 	}
-
-	typeName := namedType.Obj()
-	if typeName == nil {
-		return nil
-	}
-
-	// Get the package
-	pkg := typeName.Pkg()
-	if pkg == nil {
-		return nil
-	}
-
-	// Skip ignored packages
-	if internal.ShouldIgnorePackage(pkg.Path()) {
-		return nil
-	}
-
-	// Check if it's a local custom error type (same package)
-	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.LocalErrs.Types[typeName] {
-			errs = append(errs, facts.ErrorInfo{
-				PkgPath: a.pass.Pkg.Path(),
-				Name:    typeName.Name(),
-				Wrapped: false,
-			})
-		}
-		return errs
-	}
-
-	// For imported types, only use if they have an explicit fact
-	var errorFact facts.ErrorFact
-	if a.pass.ImportObjectFact(typeName, &errorFact) {
-		errs = append(errs, facts.ErrorInfo{
-			PkgPath: errorFact.PkgPath,
-			Name:    errorFact.Name,
-			Wrapped: false,
-		})
-	}
-
-	return errs
+	return a.resolveErrorInfoFromTypeName(namedType.Obj())
 }
 
 // getErrorsFromAlloc checks if an Alloc creates a known custom error type.
 func (a *Analyzer) getErrorsFromAlloc(v *ssa.Alloc) []facts.ErrorInfo {
-	var errs []facts.ErrorInfo
-
-	allocType := v.Type()
-	// Alloc returns a pointer
-	ptrType, ok := allocType.(*types.Pointer)
+	ptrType, ok := v.Type().(*types.Pointer)
 	if !ok {
 		return nil
 	}
-
 	namedType := internal.ExtractNamedType(ptrType.Elem())
 	if namedType == nil {
 		return nil
 	}
-
-	typeName := namedType.Obj()
-	if typeName == nil {
-		return nil
-	}
-
-	// Get the package
-	pkg := typeName.Pkg()
-	if pkg == nil {
-		return nil
-	}
-
-	// Skip ignored packages
-	if internal.ShouldIgnorePackage(pkg.Path()) {
-		return nil
-	}
-
-	// Check if it's a local custom error type (same package)
-	if pkg.Path() == a.pass.Pkg.Path() {
-		if a.LocalErrs.Types[typeName] {
-			errs = append(errs, facts.ErrorInfo{
-				PkgPath: a.pass.Pkg.Path(),
-				Name:    typeName.Name(),
-				Wrapped: false,
-			})
-		}
-		return errs
-	}
-
-	// For imported types, only use if they have an explicit fact
-	var errorFact facts.ErrorFact
-	if a.pass.ImportObjectFact(typeName, &errorFact) {
-		errs = append(errs, facts.ErrorInfo{
-			PkgPath: errorFact.PkgPath,
-			Name:    errorFact.Name,
-			Wrapped: false,
-		})
-	}
-
-	return errs
+	return a.resolveErrorInfoFromTypeName(namedType.Obj())
 }
 
-// getErrorsFromGlobal checks if a Global is a known error error.
+// getErrorsFromGlobal checks if a Global is a known error variable.
 func (a *Analyzer) getErrorsFromGlobal(v *ssa.Global) []facts.ErrorInfo {
-	var errs []facts.ErrorInfo
-
 	obj := v.Object()
 	if obj == nil {
 		return nil
@@ -667,13 +607,11 @@ func (a *Analyzer) getErrorsFromGlobal(v *ssa.Global) []facts.ErrorInfo {
 		return nil
 	}
 
-	// Get the package
 	pkg := varObj.Pkg()
 	if pkg == nil {
 		return nil
 	}
 
-	// Skip ignored packages
 	if internal.ShouldIgnorePackage(pkg.Path()) {
 		return nil
 	}
@@ -681,26 +619,24 @@ func (a *Analyzer) getErrorsFromGlobal(v *ssa.Global) []facts.ErrorInfo {
 	// Check if it's a local error (same package)
 	if pkg.Path() == a.pass.Pkg.Path() {
 		if a.LocalErrs.Vars[varObj] {
-			errs = append(errs, facts.ErrorInfo{
+			return []facts.ErrorInfo{{
 				PkgPath: a.pass.Pkg.Path(),
 				Name:    varObj.Name(),
-				Wrapped: false,
-			})
+			}}
 		}
-		return errs
+		return nil
 	}
 
 	// For imported variables, only use if they have an explicit fact
 	var errorFact facts.ErrorFact
 	if a.pass.ImportObjectFact(varObj, &errorFact) {
-		errs = append(errs, facts.ErrorInfo{
+		return []facts.ErrorInfo{{
 			PkgPath: errorFact.PkgPath,
 			Name:    errorFact.Name,
-			Wrapped: false,
-		})
+		}}
 	}
 
-	return errs
+	return nil
 }
 
 // deduplicateErrors removes duplicate errors from the list.
@@ -719,43 +655,13 @@ func (a *Analyzer) deduplicateErrors(errs []facts.ErrorInfo) []facts.ErrorInfo {
 
 // resolveParameterFlowErrors resolves concrete errors passed to functions with ParameterFlowFact.
 func (a *Analyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa.Value]bool, depth int) []facts.ErrorInfo {
-	callee := call.Call.StaticCallee()
-	if callee == nil {
+	_, typesFunc := resolveStaticCallee(call)
+	if typesFunc == nil {
 		return nil
 	}
 
-	fn := callee.Object()
-	if fn == nil {
-		return nil
-	}
-
-	typesFunc, ok := fn.(*types.Func)
-	if !ok {
-		return nil
-	}
-
-	// Check for ParameterFlowFact
-	var flowFact *facts.ParameterFlowFact
-	hasFlowFact := false
-
-	// Check local facts first
-	if localFlowFact, ok := a.LocalParamFlowFacts[typesFunc]; ok {
-		flowFact = localFlowFact
-		hasFlowFact = true
-	}
-
-	// Also check imported facts
-	var importedFlowFact facts.ParameterFlowFact
-	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
-		if flowFact == nil {
-			flowFact = &importedFlowFact
-		} else {
-			flowFact.Merge(&importedFlowFact)
-		}
-		hasFlowFact = true
-	}
-
-	if !hasFlowFact || flowFact == nil || len(flowFact.Flows) == 0 {
+	flowFact := a.lookupParameterFlowFact(typesFunc)
+	if flowFact == nil || len(flowFact.Flows) == 0 {
 		return nil
 	}
 
@@ -768,16 +674,12 @@ func (a *Analyzer) resolveParameterFlowErrors(call *ssa.Call, visited map[ssa.Va
 			continue
 		}
 
-		// Recursively trace the argument to find concrete errors
 		argErrs := a.traceValueToErrors(args[argIdx], visited, depth+1)
-
-		// Apply wrapped flag if the parameter flow is wrapped
 		for i := range argErrs {
 			if flow.Wrapped {
 				argErrs[i].Wrapped = true
 			}
 		}
-
 		errs = append(errs, argErrs...)
 	}
 
@@ -997,28 +899,12 @@ func (a *Analyzer) traceTransitiveFunctionParamCallFlow(call *ssa.Call, params [
 		return nil
 	}
 
-	fn := callee.Object()
-	if fn == nil {
+	_, typesFunc := resolveStaticCallee(call)
+	if typesFunc == nil {
 		return nil
 	}
 
-	typesFunc, ok := fn.(*types.Func)
-	if !ok {
-		return nil
-	}
-
-	// Get FunctionParamCallFlowFact for the called function
-	var callFlowFact *facts.FunctionParamCallFlowFact
-	if localFact, ok := a.LocalCallFlowFacts[typesFunc]; ok {
-		callFlowFact = localFact
-	}
-	var importedFact facts.FunctionParamCallFlowFact
-	if a.pass.ImportObjectFact(typesFunc, &importedFact) {
-		if callFlowFact == nil {
-			callFlowFact = &importedFact
-		}
-	}
-
+	callFlowFact := a.lookupCallFlowFact(typesFunc)
 	if callFlowFact == nil || len(callFlowFact.CallFlows) == 0 {
 		return nil
 	}
@@ -1123,33 +1009,12 @@ func (a *Analyzer) traceValueToParameters(val ssa.Value, params []*ssa.Parameter
 
 // traceTransitiveParameterFlow handles wrappers that call other wrappers.
 func (a *Analyzer) traceTransitiveParameterFlow(call *ssa.Call, params []*ssa.Parameter, visited map[ssa.Value]bool, depth int) []facts.ParameterFlowInfo {
-	callee := call.Call.StaticCallee()
-	if callee == nil {
+	_, typesFunc := resolveStaticCallee(call)
+	if typesFunc == nil {
 		return nil
 	}
 
-	fn := callee.Object()
-	if fn == nil {
-		return nil
-	}
-
-	typesFunc, ok := fn.(*types.Func)
-	if !ok {
-		return nil
-	}
-
-	// Get ParameterFlowFact for the called function
-	var flowFact *facts.ParameterFlowFact
-	if localFlowFact, ok := a.LocalParamFlowFacts[typesFunc]; ok {
-		flowFact = localFlowFact
-	}
-	var importedFlowFact facts.ParameterFlowFact
-	if a.pass.ImportObjectFact(typesFunc, &importedFlowFact) {
-		if flowFact == nil {
-			flowFact = &importedFlowFact
-		}
-	}
-
+	flowFact := a.lookupParameterFlowFact(typesFunc)
 	if flowFact == nil || len(flowFact.Flows) == 0 {
 		return nil
 	}
