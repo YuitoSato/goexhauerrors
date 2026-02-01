@@ -833,17 +833,27 @@ func (csa *CallSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*facts.FunctionE
 			for _, err := range callFlowErrors {
 				result.AddError(err)
 			}
+		} else if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			// Fallback for cross-package interface methods: dynamically compute
+			// intersection of FunctionParamCallFlowFact from implementations
+			if ifaceCallFlowFact := csa.getInterfaceMethodCallFlow(sel); ifaceCallFlowFact != nil {
+				callFlowErrors := resolveFunctionParamCallFlowErrors(pass, call, ifaceCallFlowFact)
+				for _, err := range callFlowErrors {
+					result.AddError(err)
+				}
+			}
+		}
+
+		// Merge InterfaceMethodFact from global store (handles DI pattern where
+		// both call flow and direct errors come from the global store)
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			if ifaceFact, _ := csa.getInterfaceMethodErrors(sel); ifaceFact != nil && len(ifaceFact.Errors) > 0 {
+				result.Merge(ifaceFact)
+			}
 		}
 
 		if len(result.Errors) > 0 {
 			return result, sig
-		}
-
-		// If no facts found yet, check if this is an interface method and look for implementations
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-			if fact, _ := csa.getInterfaceMethodErrors(sel); fact != nil && len(fact.Errors) > 0 {
-				return fact, sig
-			}
 		}
 
 		return nil, nil
@@ -852,6 +862,13 @@ func (csa *CallSiteAnalyzer) getCallErrors(call *ast.CallExpr) (*facts.FunctionE
 	// Check for interface method call (selector expression on interface type)
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if fact, sig := csa.getInterfaceMethodErrors(sel); fact != nil {
+			// Also resolve FunctionParamCallFlowFact for this interface method
+			if callFlowFact := csa.getInterfaceMethodCallFlow(sel); callFlowFact != nil && len(callFlowFact.CallFlows) > 0 {
+				callFlowErrors := resolveFunctionParamCallFlowErrors(pass, call, callFlowFact)
+				for _, err := range callFlowErrors {
+					fact.AddError(err)
+				}
+			}
 			return fact, sig
 		}
 	}
@@ -1081,6 +1098,71 @@ func (csa *CallSiteAnalyzer) getInterfaceMethodCheckedErrors(sel *ast.SelectorEx
 	}
 
 	return facts.IntersectParameterCheckedErrorsFacts(allCheckedFacts)
+}
+
+// getInterfaceMethodCallFlow returns the intersection of FunctionParamCallFlowFact
+// from all implementations of an interface method.
+// Returns nil if the receiver is not an interface type or no implementations have call flow facts.
+func (csa *CallSiteAnalyzer) getInterfaceMethodCallFlow(sel *ast.SelectorExpr) *facts.FunctionParamCallFlowFact {
+	pass := csa.Pass
+	tv := pass.TypesInfo.Types[sel.X]
+	if !tv.IsValue() {
+		return nil
+	}
+
+	ifaceType, ok := tv.Type.Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+
+	methodObj := pass.TypesInfo.Uses[sel.Sel]
+	method, ok := methodObj.(*types.Func)
+	if !ok {
+		return nil
+	}
+
+	// Check for FunctionParamCallFlowFact directly on the interface method
+	var callFlowFact facts.FunctionParamCallFlowFact
+	if pass.ImportObjectFact(method, &callFlowFact) {
+		return &callFlowFact
+	}
+
+	// Check global store for cross-package DI pattern
+	if ifaceTypeName := findInterfaceTypeName(pass, ifaceType); ifaceTypeName != nil {
+		key := facts.InterfaceMethodKey(ifaceTypeName.Pkg().Path(), ifaceTypeName.Name(), method.Name())
+		if globalFact, ok := facts.LoadCallFlowFact(key); ok {
+			// Key exists: return call flows if non-empty, otherwise nil
+			// (empty means intersection eliminated all flows — not a miss)
+			if len(globalFact.CallFlows) > 0 {
+				return globalFact
+			}
+			return nil
+		}
+		// Key absent: mark global store miss for deferred re-analysis
+		csa.hadGlobalStoreMiss = true
+	}
+
+	// Dynamically compute intersection from implementations
+	implementingTypes := csa.InterfaceImpls.GetImplementingTypes(ifaceType)
+	if len(implementingTypes) == 0 {
+		return nil
+	}
+
+	var allCallFlowFacts []*facts.FunctionParamCallFlowFact
+	for _, concreteType := range implementingTypes {
+		concreteMethod := internal.FindMethodImplementation(concreteType, method)
+		if concreteMethod == nil {
+			continue
+		}
+		var cf facts.FunctionParamCallFlowFact
+		if pass.ImportObjectFact(concreteMethod, &cf) {
+			allCallFlowFacts = append(allCallFlowFacts, &cf)
+		} else {
+			allCallFlowFacts = append(allCallFlowFacts, nil)
+		}
+	}
+
+	return facts.IntersectFunctionParamCallFlowFacts(allCallFlowFacts)
 }
 
 // flowInfo represents a parameter flow with index and wrapped flag.

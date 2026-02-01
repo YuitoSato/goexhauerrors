@@ -249,6 +249,16 @@ func (f *FunctionParamCallFlowFact) AddCallFlow(flow FunctionParamCallFlowInfo) 
 	f.CallFlows = append(f.CallFlows, flow)
 }
 
+// HasCallFlowForParam checks if any call flow exists for the given parameter index.
+func (f *FunctionParamCallFlowFact) HasCallFlowForParam(paramIndex int) bool {
+	for _, flow := range f.CallFlows {
+		if flow.ParamIndex == paramIndex {
+			return true
+		}
+	}
+	return false
+}
+
 // Merge merges another fact's flows into this one.
 func (f *FunctionParamCallFlowFact) Merge(other *FunctionParamCallFlowFact) {
 	for _, flow := range other.CallFlows {
@@ -395,6 +405,42 @@ func IntersectParameterCheckedErrorsFacts(facts []*ParameterCheckedErrorsFact) *
 	}
 
 	if len(result.Checks) == 0 {
+		return nil
+	}
+	return result
+}
+
+// IntersectFunctionParamCallFlowFacts computes the intersection of FunctionParamCallFlowFact across implementations.
+// A call flow is kept only if it exists in ALL non-nil facts.
+// If any fact is nil (implementation has no call flow), the intersection is empty.
+func IntersectFunctionParamCallFlowFacts(facts []*FunctionParamCallFlowFact) *FunctionParamCallFlowFact {
+	if len(facts) == 0 {
+		return nil
+	}
+
+	// If any implementation has no FunctionParamCallFlowFact, intersection is empty
+	for _, f := range facts {
+		if f == nil || len(f.CallFlows) == 0 {
+			return nil
+		}
+	}
+
+	// Start with the first fact's flows, keep only those present in all others
+	result := &FunctionParamCallFlowFact{}
+	for _, flow := range facts[0].CallFlows {
+		presentInAll := true
+		for _, other := range facts[1:] {
+			if !other.HasCallFlowForParam(flow.ParamIndex) {
+				presentInAll = false
+				break
+			}
+		}
+		if presentInAll {
+			result.AddCallFlow(flow)
+		}
+	}
+
+	if len(result.CallFlows) == 0 {
 		return nil
 	}
 	return result
